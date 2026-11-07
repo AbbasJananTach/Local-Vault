@@ -13,11 +13,17 @@ interface VaultDao {
     @Query("SELECT * FROM vault_items WHERE isDecoy = :isDecoy ORDER BY dateAdded DESC")
     fun getAllItems(isDecoy: Boolean): Flow<List<VaultItem>>
 
+    @Query("SELECT * FROM vault_items ORDER BY dateAdded DESC")
+    suspend fun getAllItemsSync(): List<VaultItem>
+
     @Query("SELECT * FROM vault_items WHERE isFavorite = 1 AND isDecoy = :isDecoy ORDER BY dateAdded DESC")
     fun getFavorites(isDecoy: Boolean): Flow<List<VaultItem>>
 
     @Query("SELECT * FROM vault_items WHERE folderId = :folderId AND isDecoy = :isDecoy ORDER BY dateAdded DESC")
     fun getItemsInFolder(folderId: Long, isDecoy: Boolean): Flow<List<VaultItem>>
+
+    @Query("SELECT * FROM vault_items WHERE folderId = :folderId AND isDecoy = :isDecoy")
+    suspend fun getItemsInFolderSync(folderId: Long, isDecoy: Boolean): List<VaultItem>
 
     @Query("SELECT * FROM vault_items WHERE id = :id LIMIT 1")
     suspend fun getItemById(id: Long): VaultItem?
@@ -37,6 +43,9 @@ interface VaultDao {
     @Query("DELETE FROM vault_items WHERE id IN (:ids)")
     suspend fun deleteItemsByIds(ids: List<Long>)
 
+    @Query("UPDATE vault_items SET folderId = :targetFolderId WHERE id IN (:ids)")
+    suspend fun moveItemsToFolder(ids: List<Long>, targetFolderId: Long?)
+
     @Query("SELECT SUM(fileSize) FROM vault_items WHERE isDecoy = :isDecoy")
     suspend fun getTotalVaultSize(isDecoy: Boolean): Long?
 }
@@ -45,6 +54,9 @@ interface VaultDao {
 interface FolderDao {
     @Query("SELECT * FROM folder_items WHERE isDecoy = :isDecoy ORDER BY folderName ASC")
     fun getAllFolders(isDecoy: Boolean): Flow<List<FolderItem>>
+
+    @Query("SELECT * FROM folder_items ORDER BY folderName ASC")
+    suspend fun getAllFoldersSync(): List<FolderItem>
 
     @Query("SELECT * FROM folder_items WHERE id = :id LIMIT 1")
     suspend fun getFolderById(id: Long): FolderItem?

@@ -24,7 +24,7 @@ data class LockoutStatus(
 
 class VaultHeaderManager(private val context: Context) {
 
-    private val headerFile: File
+    val headerFile: File
         get() {
             val extDir = Environment.getExternalStorageDirectory()
             val localVaultDir = File(extDir, ".LocalVaultData")
@@ -35,7 +35,6 @@ class VaultHeaderManager(private val context: Context) {
             if (primaryHeader.exists() || localVaultDir.canWrite()) {
                 return primaryHeader
             }
-            // Fallback to app external directory if external root not accessible yet
             val appExtDir = context.getExternalFilesDir(null) ?: context.filesDir
             val fallbackVaultDir = File(appExtDir, ".LocalVaultData")
             if (!fallbackVaultDir.exists()) fallbackVaultDir.mkdirs()
@@ -45,6 +44,28 @@ class VaultHeaderManager(private val context: Context) {
     @Synchronized
     fun isVaultInitialized(): Boolean {
         return headerFile.exists() && headerFile.length() > 0
+    }
+
+    @Synchronized
+    fun hasDecoyPin(): Boolean {
+        if (!isVaultInitialized()) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            json.optBoolean("hasDecoy", false) && json.has("saltDecoy") && json.has("slotDecoy")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @Synchronized
+    fun hasRecoveryPhrase(): Boolean {
+        if (!isVaultInitialized()) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            json.has("saltB") && json.has("slotB")
+        } catch (e: Exception) {
+            false
+        }
     }
 
     @Synchronized
@@ -79,8 +100,8 @@ class VaultHeaderManager(private val context: Context) {
     }
 
     @Synchronized
-    fun getLockoutStatus(): LockoutStatus {
-        if (!isVaultInitialized()) return LockoutStatus(false, 0L, 0)
+    fun getLockoutStatus(enforceLockout: Boolean = true): LockoutStatus {
+        if (!enforceLockout || !isVaultInitialized()) return LockoutStatus(false, 0L, 0)
         try {
             val json = JSONObject(headerFile.readText())
             val failedAttempts = json.optInt("failedAttempts", 0)
@@ -94,21 +115,21 @@ class VaultHeaderManager(private val context: Context) {
             val nowWall = System.currentTimeMillis()
             val nowElapsed = SystemClock.elapsedRealtime()
 
-            // Monotonic delta check + Wall clock check
-            val elapsedDeltaSeconds = if (nowElapsed >= elapsedRealtime) {
+            val elapsedDeltaSeconds = if (nowElapsed >= elapsedRealtime && elapsedRealtime > 0L) {
                 (nowElapsed - elapsedRealtime) / 1000
-            } else 0L
+            } else {
+                // Device may have rebooted; rely on wall clock delta if positive
+                if (nowWall >= wallTime) (nowWall - wallTime) / 1000 else 0L
+            }
 
             val wallDeltaSeconds = if (nowWall >= wallTime) {
                 (nowWall - wallTime) / 1000
             } else 0L
 
-            // Lockout duration is 1 Hour (3600 seconds)
             val passedSeconds = minOf(elapsedDeltaSeconds, wallDeltaSeconds)
             val lockoutDurationSeconds = 3600L
 
             if (passedSeconds >= lockoutDurationSeconds) {
-                // Reset lockout
                 json.put("failedAttempts", 0)
                 json.put("lockoutTimestampWall", 0L)
                 json.put("lockoutElapsedRealtime", 0L)
@@ -125,8 +146,8 @@ class VaultHeaderManager(private val context: Context) {
     }
 
     @Synchronized
-    fun authenticatePin(inputPin: String): Pair<AuthResult, SecretKey?> {
-        val lockout = getLockoutStatus()
+    fun authenticatePin(inputPin: String, enforceLockout: Boolean = true): Pair<AuthResult, SecretKey?> {
+        val lockout = getLockoutStatus(enforceLockout)
         if (lockout.isLockedOut) {
             return Pair(AuthResult.LOCKED_OUT, null)
         }
@@ -143,7 +164,6 @@ class VaultHeaderManager(private val context: Context) {
             val masterKeyBytes = CryptoEngine.decryptAesGcm(slotAEncrypted, pinKey)
             val masterKey = SecretKeySpec(masterKeyBytes, "AES")
 
-            // Success -> Reset failed attempts
             json.put("failedAttempts", 0)
             json.put("lockoutTimestampWall", 0L)
             json.put("lockoutElapsedRealtime", 0L)
@@ -163,27 +183,48 @@ class VaultHeaderManager(private val context: Context) {
                 val decoyMasterBytes = CryptoEngine.decryptAesGcm(slotDecoyEncrypted, decoyKey)
                 val decoyMasterKey = SecretKeySpec(decoyMasterBytes, "AES")
 
+                json.put("failedAttempts", 0)
+                json.put("lockoutTimestampWall", 0L)
+                json.put("lockoutElapsedRealtime", 0L)
+                headerFile.writeText(json.toString())
+
                 return Pair(AuthResult.SUCCESS_DECOY, decoyMasterKey)
             } catch (_: Exception) {
                 // Not decoy PIN
             }
         }
 
-        // Failed attempt -> update counter & enforce 1-hour lockout if 3 fails
-        val currentFails = json.optInt("failedAttempts", 0) + 1
-        json.put("failedAttempts", currentFails)
+        if (enforceLockout) {
+            val currentFails = json.optInt("failedAttempts", 0) + 1
+            json.put("failedAttempts", currentFails)
 
-        if (currentFails >= 3) {
-            json.put("lockoutTimestampWall", System.currentTimeMillis())
-            json.put("lockoutElapsedRealtime", SystemClock.elapsedRealtime())
-        }
+            if (currentFails >= 3) {
+                json.put("lockoutTimestampWall", System.currentTimeMillis())
+                json.put("lockoutElapsedRealtime", SystemClock.elapsedRealtime())
+            }
 
-        headerFile.writeText(json.toString())
+            headerFile.writeText(json.toString())
 
-        if (currentFails >= 3) {
-            return Pair(AuthResult.LOCKED_OUT, null)
+            if (currentFails >= 3) {
+                return Pair(AuthResult.LOCKED_OUT, null)
+            }
         }
         return Pair(AuthResult.FAILED, null)
+    }
+
+    @Synchronized
+    fun verifyRealPinOnly(inputPin: String): Boolean {
+        if (!isVaultInitialized()) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            val saltA = fromHex(json.getString("saltA"))
+            val slotAEncrypted = fromHex(json.getString("slotA"))
+            val pinKey = CryptoEngine.deriveKey(inputPin, saltA)
+            CryptoEngine.decryptAesGcm(slotAEncrypted, pinKey)
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     @Synchronized
@@ -198,7 +239,6 @@ class VaultHeaderManager(private val context: Context) {
             val masterKeyBytes = CryptoEngine.decryptAesGcm(slotBEncrypted, phraseKey)
             val masterKey = SecretKeySpec(masterKeyBytes, "AES")
 
-            // Reset lockout status upon valid recovery phrase
             json.put("failedAttempts", 0)
             json.put("lockoutTimestampWall", 0L)
             json.put("lockoutElapsedRealtime", 0L)
@@ -234,8 +274,29 @@ class VaultHeaderManager(private val context: Context) {
     }
 
     @Synchronized
+    fun updateRecoveryPhrase(masterKey: SecretKey, newPhrase: String): Boolean {
+        if (!isVaultInitialized()) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            val normalizedPhrase = newPhrase.trim().lowercase()
+            val saltB = CryptoEngine.generateRandomBytes(16)
+            val phraseDerivedKey = CryptoEngine.deriveKey(normalizedPhrase, saltB)
+            val slotBEncrypted = CryptoEngine.encryptAesGcm(masterKey.encoded, phraseDerivedKey)
+
+            json.put("saltB", toHex(saltB))
+            json.put("slotB", toHex(slotBEncrypted))
+            headerFile.writeText(json.toString())
+            true
+        } catch (e: Exception) {
+            Log.e("VaultHeader", "Failed to update recovery phrase", e)
+            false
+        }
+    }
+
+    @Synchronized
     fun setupDecoyPin(decoyPin: String): Boolean {
         if (!isVaultInitialized()) return false
+        if (verifyRealPinOnly(decoyPin)) return false // Decoy PIN must differ from Real PIN
         try {
             val json = JSONObject(headerFile.readText())
             val decoyKeyBytes = CryptoEngine.generateRandomBytes(32)
@@ -266,6 +327,27 @@ class VaultHeaderManager(private val context: Context) {
             return true
         } catch (e: Exception) {
             return false
+        }
+    }
+
+    fun createFolderCustomPinPair(customPin: String): Pair<String, String> {
+        val salt = CryptoEngine.generateRandomBytes(16)
+        val key = CryptoEngine.deriveKey(customPin, salt)
+        val verifierBytes = "FOLDER_LOCK_VERIFIED".toByteArray(Charsets.UTF_8)
+        val slotEncrypted = CryptoEngine.encryptAesGcm(verifierBytes, key)
+        return Pair(toHex(salt), toHex(slotEncrypted))
+    }
+
+    fun verifyFolderCustomPin(inputPin: String, saltHex: String?, slotHex: String?): Boolean {
+        if (saltHex.isNullOrEmpty() || slotHex.isNullOrEmpty()) return false
+        return try {
+            val salt = fromHex(saltHex)
+            val slot = fromHex(slotHex)
+            val key = CryptoEngine.deriveKey(inputPin, salt)
+            val decrypted = CryptoEngine.decryptAesGcm(slot, key)
+            String(decrypted, Charsets.UTF_8) == "FOLDER_LOCK_VERIFIED"
+        } catch (_: Exception) {
+            false
         }
     }
 

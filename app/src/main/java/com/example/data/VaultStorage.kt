@@ -7,12 +7,20 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import com.example.crypto.CryptoEngine
+import com.example.data.db.FolderItem
 import com.example.data.db.VaultDatabase
 import com.example.data.db.VaultItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -27,13 +35,14 @@ class VaultStorage(private val context: Context) {
 
     private val db = VaultDatabase.getInstance(context)
     private val vaultDao = db.vaultDao()
+    private val folderDao = db.folderDao()
 
     val vaultBlobsDir: File
         get() {
             val extDir = Environment.getExternalStorageDirectory()
             val primaryDir = File(extDir, ".LocalVaultData/blobs")
             if (!primaryDir.exists()) primaryDir.mkdirs()
-            if (primaryDir.exists() || primaryDir.canWrite()) return primaryDir
+            if (primaryDir.exists() && primaryDir.canWrite()) return primaryDir
 
             val fallbackDir = File(context.getExternalFilesDir(null) ?: context.filesDir, ".LocalVaultData/blobs")
             if (!fallbackDir.exists()) fallbackDir.mkdirs()
@@ -48,20 +57,93 @@ class VaultStorage(private val context: Context) {
         isDecoy: Boolean = false
     ): VaultItem? = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
-        var fileName = "media_${System.currentTimeMillis()}"
-        var mimeType = resolver.getType(uri) ?: "application/octet-stream"
-        var originalPath = originalPathOverride ?: ""
+        var fileName = ""
+        var reportedSize = 0L
+        var mimeType = resolver.getType(uri) ?: ""
+        var resolvedFsPath = originalPathOverride ?: ""
 
-        // Resolve original path and file name from Uri if not provided
-        if (originalPath.isEmpty()) {
-            originalPath = getPathFromUri(resolver, uri) ?: uri.path ?: ""
-        }
-        if (originalPath.isNotEmpty()) {
-            fileName = File(originalPath).name
+        // 1. Extract DISPLAY_NAME and SIZE via OpenableColumns for content:// URIs
+        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+            try {
+                resolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx != -1 && !cursor.isNull(nameIdx)) {
+                            fileName = cursor.getString(nameIdx) ?: ""
+                        }
+                        val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
+                            reportedSize = cursor.getLong(sizeIdx)
+                        }
+                        if (resolvedFsPath.isEmpty()) {
+                            val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                            if (dataIdx != -1 && !cursor.isNull(dataIdx)) {
+                                resolvedFsPath = cursor.getString(dataIdx) ?: ""
+                            } else {
+                                val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                                if (relIdx != -1 && !cursor.isNull(relIdx) && fileName.isNotEmpty()) {
+                                    val rel = cursor.getString(relIdx) ?: ""
+                                    if (rel.isNotEmpty()) {
+                                        val candidate = File(Environment.getExternalStorageDirectory(), "$rel$fileName")
+                                        if (candidate.exists()) {
+                                            resolvedFsPath = candidate.absolutePath
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "OpenableColumns query warning", e)
+            }
+        } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
+            val path = uri.path ?: ""
+            if (path.isNotEmpty()) {
+                resolvedFsPath = path
+                val f = File(path)
+                fileName = f.name
+                reportedSize = f.length()
+            }
         }
 
-        if (mimeType == "application/octet-stream" || mimeType.isBlank()) {
+        if (fileName.isEmpty() && resolvedFsPath.isNotEmpty()) {
+            fileName = File(resolvedFsPath).name
+        }
+        if (fileName.isEmpty()) {
+            val ext = when {
+                mimeType.startsWith("video") -> ".mp4"
+                mimeType.endsWith("png") -> ".png"
+                mimeType.endsWith("webp") -> ".webp"
+                else -> ".jpg"
+            }
+            fileName = "Media_${System.currentTimeMillis()}$ext"
+        }
+
+        if (mimeType.isBlank() || mimeType == "application/octet-stream") {
             mimeType = guessMimeTypeFromExtension(fileName)
+        }
+
+        // 2. Extract video duration from source URI BEFORE encrypting & deleting original
+        var durationMs = 0L
+        if (mimeType.startsWith("video")) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                    retriever.setDataSource(resolvedFsPath)
+                } else {
+                    retriever.setDataSource(context, uri)
+                }
+                val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                durationMs = durStr?.toLongOrNull() ?: 0L
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "Failed to extract video duration from source", e)
+            } finally {
+                try {
+                    retriever.release()
+                } catch (_: Exception) {
+                }
+            }
         }
 
         val blobName = "${UUID.randomUUID()}.bin"
@@ -73,15 +155,23 @@ class VaultStorage(private val context: Context) {
         var totalWritten = 0L
 
         try {
-            inputStream = resolver.openInputStream(uri) ?: FileInputStream(File(originalPath))
+            inputStream = resolver.openInputStream(uri)
+                ?: if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                    FileInputStream(File(resolvedFsPath))
+                } else null
+
+            if (inputStream == null) {
+                Log.e("VaultStorage", "Could not open input stream for $uri")
+                return@withContext null
+            }
+
             outputStream = FileOutputStream(blobFile)
 
-            // We encrypt blob using AES-CTR with baseIv for random access playback
             val cipher = Cipher.getInstance("AES/CTR/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(baseIv))
             val cipherOut = CipherOutputStream(outputStream, cipher)
 
-            val buffer = ByteArray(8192)
+            val buffer = ByteArray(16384)
             var read: Int
             while (inputStream.read(buffer).also { read = it } != -1) {
                 cipherOut.write(buffer, 0, read)
@@ -91,32 +181,24 @@ class VaultStorage(private val context: Context) {
             cipherOut.close()
             inputStream.close()
 
-            // Verify written size
-            if (blobFile.length() <= 0) {
+            if (!blobFile.exists() || blobFile.length() <= 0L) {
                 blobFile.delete()
                 return@withContext null
             }
 
-            // Extract duration for video
-            var durationMs = 0L
-            if (mimeType.startsWith("video")) {
-                try {
-                    val retriever = MediaMetadataRetriever()
-                    retriever.setDataSource(blobFile.absolutePath)
-                    val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    durationMs = durStr?.toLongOrNull() ?: 0L
-                    retriever.release()
-                } catch (e: Exception) {
-                    Log.w("VaultStorage", "Failed to extract video duration", e)
-                }
+            val finalOriginalPath = if (resolvedFsPath.isNotEmpty()) {
+                resolvedFsPath
+            } else {
+                val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                File(File(dcim, "RestoredVault"), fileName).absolutePath
             }
 
             val item = VaultItem(
                 fileName = fileName,
-                originalPath = originalPath,
+                originalPath = finalOriginalPath,
                 encryptedRelativePath = blobName,
                 mimeType = mimeType,
-                fileSize = totalWritten,
+                fileSize = if (totalWritten > 0L) totalWritten else reportedSize,
                 dateAdded = System.currentTimeMillis(),
                 folderId = targetFolderId,
                 isFavorite = false,
@@ -127,36 +209,51 @@ class VaultStorage(private val context: Context) {
 
             val insertedId = vaultDao.insertItem(item)
 
-            // Silent deletion of original file & MediaStore entry for zero public trace
-            deleteOriginalFile(uri, originalPath, resolver)
+            // 3. Delete original file & MediaStore record if accessible
+            deleteOriginalFileSafely(uri, resolvedFsPath, resolver)
 
             return@withContext item.copy(id = insertedId)
         } catch (e: Exception) {
-            Log.e("VaultStorage", "Failed to import file: $originalPath", e)
+            Log.e("VaultStorage", "Failed to import file: $uri", e)
             blobFile.delete()
             return@withContext null
         } finally {
-            try { inputStream?.close() } catch (_: Exception) {}
-            try { outputStream?.close() } catch (_: Exception) {}
+            try {
+                inputStream?.close()
+            } catch (_: Exception) {
+            }
+            try {
+                outputStream?.close()
+            } catch (_: Exception) {
+            }
         }
     }
 
-    private fun deleteOriginalFile(uri: Uri, path: String, resolver: ContentResolver) {
+    private fun deleteOriginalFileSafely(uri: Uri, fsPath: String, resolver: ContentResolver) {
         try {
-            if (path.isNotEmpty()) {
-                val origFile = File(path)
-                if (origFile.exists()) {
-                    origFile.delete()
-                    val parent = origFile.parentFile
-                    if (parent != null && parent.isDirectory && parent.listFiles().isNullOrEmpty()) {
-                        parent.delete()
+            if (fsPath.isNotEmpty()) {
+                val origFile = File(fsPath)
+                if (origFile.exists() && origFile.isFile) {
+                    val deleted = origFile.delete()
+                    if (deleted) {
+                        val parent = origFile.parentFile
+                        if (parent != null && parent.isDirectory && parent.listFiles().isNullOrEmpty()) {
+                            parent.delete()
+                        }
                     }
                 }
             }
-            // Delete from MediaStore
-            resolver.delete(uri, null, null)
         } catch (e: Exception) {
-            Log.w("VaultStorage", "Silent delete of original file failed: $path", e)
+            Log.w("VaultStorage", "Filesystem delete skipped: $fsPath", e)
+        }
+
+        try {
+            if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+                resolver.delete(uri, null, null)
+            }
+        } catch (e: Exception) {
+            // Document / Photo Picker URIs may not support direct delete without All Files path
+            Log.d("VaultStorage", "ContentResolver delete skipped for picker URI: ${e.message}")
         }
     }
 
@@ -172,29 +269,31 @@ class VaultStorage(private val context: Context) {
             targetPath = File(restoredDir, item.fileName).absolutePath
         }
 
-        val targetFile = File(targetPath)
+        var targetFile = File(targetPath)
         val parentDir = targetFile.parentFile
         if (parentDir != null && !parentDir.exists()) {
             parentDir.mkdirs()
         }
+        if (parentDir == null || !parentDir.canWrite()) {
+            val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+            val fallbackDir = File(dcim, "RestoredVault")
+            fallbackDir.mkdirs()
+            targetFile = File(fallbackDir, item.fileName)
+        }
 
         try {
-            val inputStream = FileInputStream(blobFile)
-            val outputStream = FileOutputStream(targetFile)
-            val baseIv = fromHex(item.baseIvHex)
+            FileInputStream(blobFile).use { inputStream ->
+                FileOutputStream(targetFile).use { outputStream ->
+                    val baseIv = fromHex(item.baseIvHex)
+                    CryptoEngine.decryptStreamCtr(inputStream, outputStream, masterKey, baseIv)
+                    outputStream.flush()
+                }
+            }
 
-            CryptoEngine.decryptStreamCtr(inputStream, outputStream, masterKey, baseIv)
-
-            outputStream.flush()
-            outputStream.close()
-            inputStream.close()
-
-            // Delete encrypted blob
             blobFile.delete()
-            // Delete record from DB
             vaultDao.deleteItem(item)
+            ThumbnailCacheManager.clearCache()
 
-            // Scan restored file back into MediaStore
             MediaScannerConnection.scanFile(
                 context,
                 arrayOf(targetFile.absolutePath),
@@ -217,15 +316,195 @@ class VaultStorage(private val context: Context) {
         return@withContext true
     }
 
-    private fun getPathFromUri(resolver: ContentResolver, uri: Uri): String? {
-        val proj = arrayOf(MediaStore.MediaColumns.DATA)
-        resolver.query(uri, proj, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                if (idx != -1) return cursor.getString(idx)
+    suspend fun exportEncryptedBackup(destUri: Uri, headerFile: File): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            val resolver = context.contentResolver
+            val outStream = resolver.openOutputStream(destUri)
+                ?: return@withContext Result.failure(IllegalStateException("Cannot open backup output stream"))
+
+            val allFolders = folderDao.getAllFoldersSync()
+            val allItems = vaultDao.getAllItemsSync()
+            val headerText = if (headerFile.exists()) headerFile.readText() else "{}"
+
+            val foldersJson = JSONArray()
+            allFolders.forEach { folder ->
+                foldersJson.put(
+                    JSONObject().apply {
+                        put("id", folder.id)
+                        put("folderName", folder.folderName)
+                        put("isLocked", folder.isLocked)
+                        put("lockType", folder.lockType)
+                        put("customPinSaltHex", folder.customPinSaltHex ?: "")
+                        put("customPinSlotAHex", folder.customPinSlotAHex ?: "")
+                        put("isDecoy", folder.isDecoy)
+                    }
+                )
             }
+
+            val itemsJson = JSONArray()
+            val validItems = mutableListOf<Pair<VaultItem, File>>()
+            allItems.forEach { item ->
+                val blob = File(vaultBlobsDir, item.encryptedRelativePath)
+                if (blob.exists()) {
+                    validItems.add(item to blob)
+                    itemsJson.put(
+                        JSONObject().apply {
+                            put("id", item.id)
+                            put("fileName", item.fileName)
+                            put("originalPath", item.originalPath)
+                            put("encryptedRelativePath", item.encryptedRelativePath)
+                            put("mimeType", item.mimeType)
+                            put("fileSize", item.fileSize)
+                            put("dateAdded", item.dateAdded)
+                            put("folderId", item.folderId ?: -1L)
+                            put("isFavorite", item.isFavorite)
+                            put("isDecoy", item.isDecoy)
+                            put("durationMs", item.durationMs)
+                            put("baseIvHex", item.baseIvHex)
+                        }
+                    )
+                }
+            }
+
+            DataOutputStream(BufferedOutputStream(outStream)).use { dos ->
+                // Magic Header
+                dos.writeBytes("LVB1")
+                // Vault Header JSON
+                val headerBytes = headerText.toByteArray(Charsets.UTF_8)
+                dos.writeInt(headerBytes.size)
+                dos.write(headerBytes)
+
+                // Folders JSON
+                val foldersBytes = foldersJson.toString().toByteArray(Charsets.UTF_8)
+                dos.writeInt(foldersBytes.size)
+                dos.write(foldersBytes)
+
+                // Items JSON
+                val itemsBytes = itemsJson.toString().toByteArray(Charsets.UTF_8)
+                dos.writeInt(itemsBytes.size)
+                dos.write(itemsBytes)
+
+                // Blobs count & binary content
+                dos.writeInt(validItems.size)
+                val buf = ByteArray(16384)
+                for ((item, blobFile) in validItems) {
+                    val nameBytes = item.encryptedRelativePath.toByteArray(Charsets.UTF_8)
+                    dos.writeInt(nameBytes.size)
+                    dos.write(nameBytes)
+                    val len = blobFile.length()
+                    dos.writeLong(len)
+                    FileInputStream(blobFile).use { fis ->
+                        var r: Int
+                        while (fis.read(buf).also { r = it } != -1) {
+                            dos.write(buf, 0, r)
+                        }
+                    }
+                }
+                dos.flush()
+            }
+            Result.success(validItems.size)
+        } catch (e: Exception) {
+            Log.e("VaultStorage", "Failed to create .lvb backup", e)
+            Result.failure(e)
         }
-        return uri.path
+    }
+
+    suspend fun restoreEncryptedBackup(sourceUri: Uri, headerFile: File): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            val resolver = context.contentResolver
+            val inStream = resolver.openInputStream(sourceUri)
+                ?: return@withContext Result.failure(IllegalStateException("Cannot open backup file"))
+
+            DataInputStream(BufferedInputStream(inStream)).use { dis ->
+                val magic = ByteArray(4)
+                dis.readFully(magic)
+                if (String(magic, Charsets.US_ASCII) != "LVB1") {
+                    return@withContext Result.failure(IllegalArgumentException("Invalid .lvb backup archive format"))
+                }
+
+                val headerLen = dis.readInt()
+                val headerBytes = ByteArray(headerLen)
+                dis.readFully(headerBytes)
+                val headerJsonStr = String(headerBytes, Charsets.UTF_8)
+                if (headerJsonStr.isNotBlank() && headerJsonStr != "{}") {
+                    headerFile.writeText(headerJsonStr)
+                }
+
+                val foldersLen = dis.readInt()
+                val foldersBytes = ByteArray(foldersLen)
+                dis.readFully(foldersBytes)
+                val foldersArray = JSONArray(String(foldersBytes, Charsets.UTF_8))
+
+                for (i in 0 until foldersArray.length()) {
+                    val obj = foldersArray.getJSONObject(i)
+                    folderDao.insertFolder(
+                        FolderItem(
+                            id = obj.optLong("id", 0L),
+                            folderName = obj.getString("folderName"),
+                            isLocked = obj.optBoolean("isLocked", false),
+                            lockType = obj.optString("lockType", "MAIN_PIN"),
+                            customPinSaltHex = obj.optString("customPinSaltHex", "").ifEmpty { null },
+                            customPinSlotAHex = obj.optString("customPinSlotAHex", "").ifEmpty { null },
+                            isDecoy = obj.optBoolean("isDecoy", false)
+                        )
+                    )
+                }
+
+                val itemsLen = dis.readInt()
+                val itemsBytes = ByteArray(itemsLen)
+                dis.readFully(itemsBytes)
+                val itemsArray = JSONArray(String(itemsBytes, Charsets.UTF_8))
+
+                val blobCount = dis.readInt()
+                val buf = ByteArray(16384)
+                for (i in 0 until blobCount) {
+                    val nameLen = dis.readInt()
+                    val nameBytes = ByteArray(nameLen)
+                    dis.readFully(nameBytes)
+                    val blobName = String(nameBytes, Charsets.UTF_8)
+                    val blobSize = dis.readLong()
+
+                    val targetBlob = File(vaultBlobsDir, blobName)
+                    FileOutputStream(targetBlob).use { fos ->
+                        var remaining = blobSize
+                        while (remaining > 0L) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val read = dis.read(buf, 0, toRead)
+                            if (read == -1) break
+                            fos.write(buf, 0, read)
+                            remaining -= read
+                        }
+                        fos.flush()
+                    }
+                }
+
+                for (i in 0 until itemsArray.length()) {
+                    val obj = itemsArray.getJSONObject(i)
+                    val rawFolderId = obj.optLong("folderId", -1L)
+                    vaultDao.insertItem(
+                        VaultItem(
+                            id = obj.optLong("id", 0L),
+                            fileName = obj.getString("fileName"),
+                            originalPath = obj.optString("originalPath", ""),
+                            encryptedRelativePath = obj.getString("encryptedRelativePath"),
+                            mimeType = obj.optString("mimeType", "image/jpeg"),
+                            fileSize = obj.optLong("fileSize", 0L),
+                            dateAdded = obj.optLong("dateAdded", System.currentTimeMillis()),
+                            folderId = if (rawFolderId == -1L) null else rawFolderId,
+                            isFavorite = obj.optBoolean("isFavorite", false),
+                            isDecoy = obj.optBoolean("isDecoy", false),
+                            durationMs = obj.optLong("durationMs", 0L),
+                            baseIvHex = obj.getString("baseIvHex")
+                        )
+                    )
+                }
+
+                return@withContext Result.success(itemsArray.length())
+            }
+        } catch (e: Exception) {
+            Log.e("VaultStorage", "Failed to restore .lvb backup", e)
+            Result.failure(e)
+        }
     }
 
     private fun guessMimeTypeFromExtension(fileName: String): String {
@@ -235,10 +514,12 @@ class VaultStorage(private val context: Context) {
             "png" -> "image/png"
             "gif" -> "image/gif"
             "webp" -> "image/webp"
-            "mp4" -> "video/mp4"
-            "mkdir", "mkv" -> "video/x-matroska"
+            "mp4", "m4v" -> "video/mp4"
+            "mkv" -> "video/x-matroska"
             "avi" -> "video/x-msvideo"
             "mov" -> "video/quicktime"
+            "3gp" -> "video/3gpp"
+            "webm" -> "video/webm"
             else -> "image/jpeg"
         }
     }

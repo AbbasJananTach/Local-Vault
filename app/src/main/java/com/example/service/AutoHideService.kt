@@ -12,19 +12,22 @@ import android.os.FileObserver
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.example.crypto.VaultHeaderManager
 import com.example.data.VaultStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import javax.crypto.SecretKey
+import javax.crypto.spec.SecretKeySpec
 
 class AutoHideService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val observers = mutableListOf<FileObserver>()
+    private var activeMasterKey: SecretKey? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -37,6 +40,10 @@ class AutoHideService : Service() {
         val watchedPaths = intent?.getStringArrayExtra("WATCHED_PATHS") ?: emptyArray()
         val targetFolderId = intent?.getLongExtra("TARGET_FOLDER_ID", -1L)?.let { if (it == -1L) null else it }
         val isDecoy = intent?.getBooleanExtra("IS_DECOY", false) ?: false
+        val keyBytes = intent?.getByteArrayExtra("MASTER_KEY_BYTES")
+        if (keyBytes != null && keyBytes.size == 32) {
+            activeMasterKey = SecretKeySpec(keyBytes, "AES")
+        }
 
         setupFileObservers(watchedPaths, targetFolderId, isDecoy)
         return START_STICKY
@@ -69,19 +76,15 @@ class AutoHideService : Service() {
         startForeground(1001, notification)
     }
 
-
     private fun setupFileObservers(paths: Array<String>, targetFolderId: Long?, isDecoy: Boolean) {
         stopObservers()
         val vaultStorage = VaultStorage(this)
-        val headerManager = VaultHeaderManager(this)
 
         paths.forEach { pathStr ->
             val folder = File(pathStr)
             if (folder.exists() && folder.isDirectory) {
-                // First sweep existing files
                 sweepFolder(folder, vaultStorage, targetFolderId, isDecoy)
 
-                // Start observing new files
                 val observer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     object : FileObserver(folder, CREATE or CLOSE_WRITE or MOVED_TO) {
                         override fun onEvent(event: Int, path: String?) {
@@ -111,7 +114,7 @@ class AutoHideService : Service() {
     private fun sweepFolder(folder: File, vaultStorage: VaultStorage, targetFolderId: Long?, isDecoy: Boolean) {
         serviceScope.launch {
             folder.listFiles()?.forEach { file ->
-                if (file.isFile && !file.name.startsWith(".")) {
+                if (file.isFile && !file.name.startsWith(".") && isMediaFile(file.name)) {
                     importFileInternal(file, vaultStorage, targetFolderId, isDecoy)
                 }
             }
@@ -119,11 +122,10 @@ class AutoHideService : Service() {
     }
 
     private fun processNewFile(file: File, vaultStorage: VaultStorage, targetFolderId: Long?, isDecoy: Boolean) {
-        if (!file.exists() || !file.isFile || file.name.startsWith(".")) return
+        if (!file.exists() || !file.isFile || file.name.startsWith(".") || !isMediaFile(file.name)) return
         serviceScope.launch {
-            // Short delay to allow file write to finish
-            kotlinx.coroutines.delay(500)
-            if (file.exists()) {
+            delay(700)
+            if (file.exists() && file.length() > 0) {
                 importFileInternal(file, vaultStorage, targetFolderId, isDecoy)
             }
         }
@@ -135,12 +137,24 @@ class AutoHideService : Service() {
         targetFolderId: Long?,
         isDecoy: Boolean
     ) {
+        val key = activeMasterKey ?: return
         try {
-            // Retrieve master key if available or skip
-            Log.i("AutoHideService", "Auto-hiding file: ${file.absolutePath}")
+            vaultStorage.importFile(
+                uri = Uri.fromFile(file),
+                originalPathOverride = file.absolutePath,
+                targetFolderId = targetFolderId,
+                masterKey = key,
+                isDecoy = isDecoy
+            )
+            Log.i("AutoHideService", "Auto-hidden file: ${file.absolutePath}")
         } catch (e: Exception) {
             Log.e("AutoHideService", "Failed to auto-hide file", e)
         }
+    }
+
+    private fun isMediaFile(name: String): Boolean {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "mp4", "mkv", "mov", "avi", "3gp", "webm")
     }
 
     private fun stopObservers() {

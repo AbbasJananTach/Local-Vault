@@ -1,6 +1,7 @@
 package com.example.ui.viewer
 
 import android.graphics.BitmapFactory
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -58,6 +59,7 @@ fun PhotoViewerScreen(
     onUnhide: (VaultItem) -> Unit,
     onDelete: (VaultItem) -> Unit
 ) {
+    BackHandler { onBack() }
     var scale by remember { mutableFloatStateOf(1f) }
     var rotationAngle by remember { mutableFloatStateOf(0f) }
     var isFavorite by remember { mutableStateOf(vaultItem.isFavorite) }
