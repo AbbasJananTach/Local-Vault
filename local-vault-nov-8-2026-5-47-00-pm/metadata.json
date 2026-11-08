@@ -1,6 +1,0 @@
-{
-  "name": "Local Vault",
-  "description": "Zero-internet private media vault with dual-wrapped encryption, Argon2/PBKDF2 key derivation, decoy PIN mode, and hardened lockout.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
