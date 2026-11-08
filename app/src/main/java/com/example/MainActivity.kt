@@ -279,6 +279,7 @@ class MainActivity : ComponentActivity() {
                                     items = items,
                                     folders = folders,
                                     vaultBlobsDir = vaultStorage.vaultBlobsDir,
+                                    vaultStorage = vaultStorage,
                                     masterKey = activeKey,
                                     isDecoyMode = isDecoyVault,
                                     defaultGridColumns = defaultGridColumns,
@@ -289,6 +290,9 @@ class MainActivity : ComponentActivity() {
                                         pendingImportFolderId = targetFolderId
                                         isLaunchingExternalPicker = true
                                         pickFilesLauncher.launch("*/*")
+                                    },
+                                    onImportDirectFiles = { paths, targetFolderId ->
+                                        importDirectFiles(paths, targetFolderId)
                                     },
                                     onCreateFolder = { name, isLocked, lockType, customPin ->
                                         scope.launch(Dispatchers.IO) {
@@ -624,6 +628,56 @@ class MainActivity : ComponentActivity() {
                     Toast.makeText(
                         this@MainActivity,
                         "Failed to import selected media. Check storage permissions.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun importDirectFiles(paths: List<String>, targetFolderId: Long?) {
+        val key = masterKey ?: return
+        lifecycleScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) {
+                isImporting.value = true
+                importProgressText.value = "Encrypting & wiping ${paths.size} file(s)..."
+            }
+
+            var successCount = 0
+            paths.forEachIndexed { index, path ->
+                withContext(Dispatchers.Main) {
+                    importProgressText.value = "Encrypting ${index + 1} of ${paths.size}..."
+                }
+                val file = File(path)
+                if (file.exists() && file.isFile) {
+                    val uri = Uri.fromFile(file)
+                    val imported = vaultStorage.importFile(
+                        uri = uri,
+                        originalPathOverride = path,
+                        targetFolderId = targetFolderId,
+                        masterKey = key,
+                        isDecoy = isDecoyVault
+                    )
+                    if (imported != null) {
+                        successCount++
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                isImporting.value = false
+                importProgressText.value = ""
+                if (successCount > 0) {
+                    ThumbnailCacheManager.clearCache()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Imported & deleted $successCount file(s) from device",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Failed to import selected files. Check storage permissions.",
                         Toast.LENGTH_LONG
                     ).show()
                 }

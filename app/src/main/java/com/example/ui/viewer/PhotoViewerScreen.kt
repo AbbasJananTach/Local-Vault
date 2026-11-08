@@ -2,7 +2,6 @@ package com.example.ui.viewer
 
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -11,13 +10,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Unpublished
 import androidx.compose.material3.Icon
@@ -26,7 +26,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -42,7 +41,6 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.crypto.CryptoEngine
 import com.example.data.db.VaultItem
-import kotlinx.coroutines.delay
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -63,7 +61,6 @@ fun PhotoViewerScreen(
     var scale by remember { mutableFloatStateOf(1f) }
     var rotationAngle by remember { mutableFloatStateOf(0f) }
     var isFavorite by remember { mutableStateOf(vaultItem.isFavorite) }
-    var isSlideshowActive by remember { mutableStateOf(false) }
 
     // Decrypt photo in memory for instant display
     val decryptedBitmap = remember(vaultItem.id) {
@@ -108,13 +105,14 @@ fun PhotoViewerScreen(
                 )
             }
 
-            // Top Bar
+            // Top Bar with statusBarsPadding
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.TopCenter)
-                    .background(Color.Black.copy(alpha = 0.6f))
-                    .padding(12.dp),
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -127,7 +125,9 @@ fun PhotoViewerScreen(
                     color = Color.White,
                     style = MaterialTheme.typography.titleMedium,
                     maxLines = 1,
-                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 12.dp)
                 )
 
                 IconButton(
@@ -138,13 +138,14 @@ fun PhotoViewerScreen(
                 }
             }
 
-            // Bottom Actions Bar
+            // Bottom Actions Bar with navigationBarsPadding
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
-                    .background(Color.Black.copy(alpha = 0.7f))
-                    .padding(16.dp),
+                    .background(Color.Black.copy(alpha = 0.75f))
+                    .navigationBarsPadding()
+                    .padding(horizontal = 24.dp, vertical = 14.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -159,7 +160,7 @@ fun PhotoViewerScreen(
                     Icon(
                         imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                         contentDescription = "Favorite",
-                        tint = if (isFavorite) Color.Red else Color.White
+                        tint = if (isFavorite) Color(0xFFFF4757) else Color.White
                     )
                 }
 
@@ -168,7 +169,7 @@ fun PhotoViewerScreen(
                     onClick = { onUnhide(vaultItem) },
                     modifier = Modifier.testTag("unhide_photo")
                 ) {
-                    Icon(Icons.Default.Unpublished, "Unhide", tint = Color.White)
+                    Icon(Icons.Default.Unpublished, "Unhide", tint = MaterialTheme.colorScheme.secondary)
                 }
 
                 // Delete Permanently
@@ -176,7 +177,7 @@ fun PhotoViewerScreen(
                     onClick = { onDelete(vaultItem) },
                     modifier = Modifier.testTag("delete_photo")
                 ) {
-                    Icon(Icons.Default.Delete, "Delete", tint = Color.Red)
+                    Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
                 }
             }
         }

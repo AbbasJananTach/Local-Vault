@@ -6,6 +6,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
@@ -31,6 +32,16 @@ import javax.crypto.CipherOutputStream
 import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 
+data class DeviceMediaItem(
+    val id: Long,
+    val path: String,
+    val name: String,
+    val size: Long,
+    val dateModified: Long,
+    val isVideo: Boolean,
+    val folderName: String
+)
+
 class VaultStorage(private val context: Context) {
 
     private val db = VaultDatabase.getInstance(context)
@@ -42,12 +53,124 @@ class VaultStorage(private val context: Context) {
             val extDir = Environment.getExternalStorageDirectory()
             val primaryDir = File(extDir, ".LocalVaultData/blobs")
             if (!primaryDir.exists()) primaryDir.mkdirs()
-            if (primaryDir.exists() && primaryDir.canWrite()) return primaryDir
+            if (primaryDir.exists() || primaryDir.canWrite()) return primaryDir
 
             val fallbackDir = File(context.getExternalFilesDir(null) ?: context.filesDir, ".LocalVaultData/blobs")
             if (!fallbackDir.exists()) fallbackDir.mkdirs()
             return fallbackDir
         }
+
+    /**
+     * Queries all device media files directly from MediaStore with real filesystem paths.
+     * Excludes anything already inside the .LocalVaultData folder.
+     */
+    suspend fun queryDeviceMediaFiles(folderFilter: String? = null): List<DeviceMediaItem> = withContext(Dispatchers.IO) {
+        val result = mutableListOf<DeviceMediaItem>()
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DATE_MODIFIED,
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME
+        )
+
+        val selection = "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?)" +
+            " AND ${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%'"
+
+        val selectionArgs = arrayOf(
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        )
+
+        val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+
+        try {
+            context.contentResolver.query(
+                MediaStore.Files.getContentUri("external"),
+                projection,
+                selection,
+                selectionArgs,
+                sortOrder
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndex(MediaStore.Files.FileColumns._ID)
+                val dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                val nameCol = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                val sizeCol = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                val dateCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
+                val typeCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
+                val bucketCol = cursor.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
+
+                while (cursor.moveToNext()) {
+                    val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
+                    val file = File(path)
+                    if (path.isNotEmpty() && file.exists() && file.isFile && file.length() > 0) {
+                        val folderName = if (bucketCol != -1) cursor.getString(bucketCol) ?: file.parentFile?.name ?: "Other" else file.parentFile?.name ?: "Other"
+                        if (folderFilter == null || folderName.equals(folderFilter, ignoreCase = true)) {
+                            val id = if (idCol != -1) cursor.getLong(idCol) else 0L
+                            val name = if (nameCol != -1) cursor.getString(nameCol) ?: file.name else file.name
+                            val size = if (sizeCol != -1) cursor.getLong(sizeCol) else file.length()
+                            val dateMod = if (dateCol != -1) cursor.getLong(dateCol) * 1000L else file.lastModified()
+                            val isVideo = if (typeCol != -1) cursor.getInt(typeCol) == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO else false
+
+                            result.add(
+                                DeviceMediaItem(
+                                    id = id,
+                                    path = path,
+                                    name = name,
+                                    size = size,
+                                    dateModified = dateMod,
+                                    isVideo = isVideo,
+                                    folderName = folderName
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("VaultStorage", "Failed to query device media files from MediaStore", e)
+        }
+        return@withContext result
+    }
+
+    /**
+     * Queries available device folder names containing media.
+     */
+    suspend fun queryDeviceFolders(): List<String> = withContext(Dispatchers.IO) {
+        val folders = mutableSetOf<String>()
+        val projection = arrayOf(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME, MediaStore.MediaColumns.DATA)
+        val selection = "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?)" +
+            " AND ${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%'"
+        val selectionArgs = arrayOf(
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        )
+
+        try {
+            context.contentResolver.query(
+                MediaStore.Files.getContentUri("external"),
+                projection,
+                selection,
+                selectionArgs,
+                "${MediaStore.MediaColumns.BUCKET_DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                val bucketCol = cursor.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    if (bucketCol != -1) {
+                        val name = cursor.getString(bucketCol)
+                        if (!name.isNullOrBlank()) {
+                            folders.add(name)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("VaultStorage", "Failed to query device folders", e)
+        }
+        return@withContext folders.sorted()
+    }
 
     suspend fun importFile(
         uri: Uri,
@@ -61,9 +184,25 @@ class VaultStorage(private val context: Context) {
         var reportedSize = 0L
         var mimeType = resolver.getType(uri) ?: ""
         var resolvedFsPath = originalPathOverride ?: ""
+        var mediaStoreId: Long? = null
 
-        // 1. Extract DISPLAY_NAME and SIZE via OpenableColumns for content:// URIs
-        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+        // 1. Resolve metadata from URI or direct file
+        if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+            val f = File(resolvedFsPath)
+            fileName = f.name
+            reportedSize = f.length()
+            if (mimeType.isBlank() || mimeType == "application/octet-stream") {
+                mimeType = guessMimeTypeFromExtension(fileName)
+            }
+        } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
+            val path = uri.path ?: ""
+            if (path.isNotEmpty() && File(path).exists()) {
+                resolvedFsPath = path
+                val f = File(path)
+                fileName = f.name
+                reportedSize = f.length()
+            }
+        } else if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
             try {
                 resolver.query(uri, null, null, null, null)?.use { cursor ->
                     if (cursor.moveToFirst()) {
@@ -75,35 +214,28 @@ class VaultStorage(private val context: Context) {
                         if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
                             reportedSize = cursor.getLong(sizeIdx)
                         }
-                        if (resolvedFsPath.isEmpty()) {
-                            val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                            if (dataIdx != -1 && !cursor.isNull(dataIdx)) {
-                                resolvedFsPath = cursor.getString(dataIdx) ?: ""
-                            } else {
-                                val relIdx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
-                                if (relIdx != -1 && !cursor.isNull(relIdx) && fileName.isNotEmpty()) {
-                                    val rel = cursor.getString(relIdx) ?: ""
-                                    if (rel.isNotEmpty()) {
-                                        val candidate = File(Environment.getExternalStorageDirectory(), "$rel$fileName")
-                                        if (candidate.exists()) {
-                                            resolvedFsPath = candidate.absolutePath
-                                        }
-                                    }
-                                }
+                        val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                        if (dataIdx != -1 && !cursor.isNull(dataIdx)) {
+                            val candidate = cursor.getString(dataIdx) ?: ""
+                            if (candidate.isNotEmpty() && File(candidate).exists()) {
+                                resolvedFsPath = candidate
                             }
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.w("VaultStorage", "OpenableColumns query warning", e)
+                Log.w("VaultStorage", "Query OpenableColumns failed", e)
             }
-        } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
-            val path = uri.path ?: ""
-            if (path.isNotEmpty()) {
-                resolvedFsPath = path
-                val f = File(path)
-                fileName = f.name
-                reportedSize = f.length()
+        }
+
+        // 2. If real filesystem path is not known yet, use All Files access & MediaStore to resolve it
+        if (resolvedFsPath.isEmpty() || !File(resolvedFsPath).exists()) {
+            val resolved = resolveRealPathAndId(uri, fileName, reportedSize)
+            if (resolved.first != null) {
+                resolvedFsPath = resolved.first!!
+            }
+            if (resolved.second != null) {
+                mediaStoreId = resolved.second
             }
         }
 
@@ -124,7 +256,7 @@ class VaultStorage(private val context: Context) {
             mimeType = guessMimeTypeFromExtension(fileName)
         }
 
-        // 2. Extract video duration from source URI BEFORE encrypting & deleting original
+        // 3. Extract video duration before encrypting and deleting original file
         var durationMs = 0L
         if (mimeType.startsWith("video")) {
             val retriever = MediaMetadataRetriever()
@@ -155,13 +287,14 @@ class VaultStorage(private val context: Context) {
         var totalWritten = 0L
 
         try {
-            inputStream = resolver.openInputStream(uri)
-                ?: if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
-                    FileInputStream(File(resolvedFsPath))
-                } else null
+            inputStream = if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                FileInputStream(File(resolvedFsPath))
+            } else {
+                resolver.openInputStream(uri)
+            }
 
             if (inputStream == null) {
-                Log.e("VaultStorage", "Could not open input stream for $uri")
+                Log.e("VaultStorage", "Could not open input stream for $uri ($resolvedFsPath)")
                 return@withContext null
             }
 
@@ -209,8 +342,8 @@ class VaultStorage(private val context: Context) {
 
             val insertedId = vaultDao.insertItem(item)
 
-            // 3. Delete original file & MediaStore record if accessible
-            deleteOriginalFileSafely(uri, resolvedFsPath, resolver)
+            // 4. GUARANTEED SILENT DELETION: Delete physical file, MediaStore entry, and trigger MediaScanner
+            deleteOriginalFileSafely(uri, resolvedFsPath, mediaStoreId, resolver)
 
             return@withContext item.copy(id = insertedId)
         } catch (e: Exception) {
@@ -229,31 +362,206 @@ class VaultStorage(private val context: Context) {
         }
     }
 
-    private fun deleteOriginalFileSafely(uri: Uri, fsPath: String, resolver: ContentResolver) {
-        try {
-            if (fsPath.isNotEmpty()) {
+    private fun resolveRealPathAndId(uri: Uri, fileName: String, reportedSize: Long): Pair<String?, Long?> {
+        // A. Document URI resolution
+        if (DocumentsContract.isDocumentUri(context, uri)) {
+            try {
+                val docId = DocumentsContract.getDocumentId(uri)
+                if (docId.startsWith("raw:")) {
+                    val p = docId.removePrefix("raw:")
+                    if (File(p).exists()) return Pair(p, null)
+                }
+                if (docId.startsWith("primary:")) {
+                    val rel = docId.removePrefix("primary:")
+                    val candidate = File(Environment.getExternalStorageDirectory(), rel)
+                    if (candidate.exists()) return Pair(candidate.absolutePath, null)
+                }
+                if (docId.contains(":")) {
+                    val parts = docId.split(":")
+                    val type = parts[0]
+                    val id = parts.getOrNull(1)?.toLongOrNull()
+                    if (id != null) {
+                        val contentUri = when (type) {
+                            "image" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                            "video" -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                            else -> MediaStore.Files.getContentUri("external")
+                        }
+                        val path = queryPathFromMediaStore(contentUri, id)
+                        if (path != null) return Pair(path, id)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "DocumentUri resolution failed", e)
+            }
+        }
+
+        // B. Path/ID from MediaStore by segment
+        val lastSeg = uri.lastPathSegment?.toLongOrNull()
+        if (lastSeg != null) {
+            val path = queryPathFromMediaStore(MediaStore.Files.getContentUri("external"), lastSeg)
+            if (path != null) return Pair(path, lastSeg)
+        }
+
+        // C. Match by DISPLAY_NAME and reported SIZE in MediaStore
+        if (fileName.isNotEmpty()) {
+            val projection = arrayOf(
+                MediaStore.Files.FileColumns._ID,
+                MediaStore.MediaColumns.DATA,
+                MediaStore.MediaColumns.SIZE
+            )
+            val selection = if (reportedSize > 0) {
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.SIZE} = ?"
+            } else {
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
+            }
+            val args = if (reportedSize > 0) arrayOf(fileName, reportedSize.toString()) else arrayOf(fileName)
+
+            try {
+                context.contentResolver.query(
+                    MediaStore.Files.getContentUri("external"),
+                    projection,
+                    selection,
+                    args,
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns._ID)
+                        val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                        val id = if (idIdx != -1) cursor.getLong(idIdx) else null
+                        val path = if (dataIdx != -1) cursor.getString(dataIdx) else null
+                        if (path != null && File(path).exists()) {
+                            return Pair(path, id)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "Match by name/size in MediaStore failed", e)
+            }
+
+            // D. Fallback check common standard directories on external storage
+            val ext = Environment.getExternalStorageDirectory()
+            val candidateDirs = listOf(
+                File(ext, "DCIM/Camera"),
+                File(ext, "Pictures/Screenshots"),
+                File(ext, "Pictures"),
+                File(ext, "Download"),
+                File(ext, "DCIM"),
+                File(ext, "Movies"),
+                File(ext, "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images"),
+                File(ext, "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video"),
+                File(ext, "WhatsApp/Media/WhatsApp Images"),
+                File(ext, "WhatsApp/Media/WhatsApp Video")
+            )
+
+            for (dir in candidateDirs) {
+                val candidateFile = File(dir, fileName)
+                if (candidateFile.exists() && candidateFile.isFile) {
+                    if (reportedSize <= 0 || candidateFile.length() == reportedSize) {
+                        return Pair(candidateFile.absolutePath, null)
+                    }
+                }
+            }
+        }
+
+        return Pair(null, null)
+    }
+
+    private fun queryPathFromMediaStore(contentUri: Uri, id: Long): String? {
+        return try {
+            context.contentResolver.query(
+                contentUri,
+                arrayOf(MediaStore.MediaColumns.DATA),
+                "${MediaStore.Files.FileColumns._ID} = ?",
+                arrayOf(id.toString()),
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    if (idx != -1) {
+                        val p = cursor.getString(idx)
+                        if (!p.isNullOrEmpty() && File(p).exists()) p else null
+                    } else null
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun deleteOriginalFileSafely(
+        uri: Uri,
+        fsPath: String,
+        mediaStoreId: Long?,
+        resolver: ContentResolver
+    ) {
+        var physicallyDeleted = false
+
+        // 1. Physical file delete with MANAGE_EXTERNAL_STORAGE
+        if (fsPath.isNotEmpty()) {
+            try {
                 val origFile = File(fsPath)
                 if (origFile.exists() && origFile.isFile) {
-                    val deleted = origFile.delete()
-                    if (deleted) {
-                        val parent = origFile.parentFile
-                        if (parent != null && parent.isDirectory && parent.listFiles().isNullOrEmpty()) {
+                    physicallyDeleted = origFile.delete()
+                    Log.i("VaultStorage", "Physical file deleted ($physicallyDeleted): $fsPath")
+                    val parent = origFile.parentFile
+                    if (parent != null && parent.isDirectory && parent.listFiles().isNullOrEmpty()) {
+                        if (parent.absolutePath != Environment.getExternalStorageDirectory().absolutePath) {
                             parent.delete()
                         }
                     }
                 }
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "Physical deletion error: $fsPath", e)
             }
-        } catch (e: Exception) {
-            Log.w("VaultStorage", "Filesystem delete skipped: $fsPath", e)
         }
 
+        // 2. Delete MediaStore row by ID
+        if (mediaStoreId != null) {
+            try {
+                val filesUri = MediaStore.Files.getContentUri("external")
+                val rows = resolver.delete(
+                    filesUri,
+                    "${MediaStore.Files.FileColumns._ID} = ?",
+                    arrayOf(mediaStoreId.toString())
+                )
+                Log.i("VaultStorage", "MediaStore rows deleted: $rows for ID $mediaStoreId")
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "MediaStore delete by ID failed", e)
+            }
+        }
+
+        // 3. Delete MediaStore row by DATA path
+        if (fsPath.isNotEmpty()) {
+            try {
+                val filesUri = MediaStore.Files.getContentUri("external")
+                resolver.delete(
+                    filesUri,
+                    "${MediaStore.MediaColumns.DATA} = ?",
+                    arrayOf(fsPath)
+                )
+            } catch (_: Exception) {
+            }
+
+            // 4. Run MediaScanner on the path so Gallery and File Managers remove cached thumbnails
+            try {
+                MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(fsPath),
+                    null
+                ) { path, scannedUri ->
+                    Log.d("VaultStorage", "MediaScanner purged path: $path, uri: $scannedUri")
+                }
+            } catch (e: Exception) {
+                Log.w("VaultStorage", "MediaScanner purge error", e)
+            }
+        }
+
+        // 5. Try URI delete as fallback
         try {
             if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
                 resolver.delete(uri, null, null)
             }
-        } catch (e: Exception) {
-            // Document / Photo Picker URIs may not support direct delete without All Files path
-            Log.d("VaultStorage", "ContentResolver delete skipped for picker URI: ${e.message}")
+        } catch (_: Exception) {
         }
     }
 
@@ -367,24 +675,19 @@ class VaultStorage(private val context: Context) {
             }
 
             DataOutputStream(BufferedOutputStream(outStream)).use { dos ->
-                // Magic Header
                 dos.writeBytes("LVB1")
-                // Vault Header JSON
                 val headerBytes = headerText.toByteArray(Charsets.UTF_8)
                 dos.writeInt(headerBytes.size)
                 dos.write(headerBytes)
 
-                // Folders JSON
                 val foldersBytes = foldersJson.toString().toByteArray(Charsets.UTF_8)
                 dos.writeInt(foldersBytes.size)
                 dos.write(foldersBytes)
 
-                // Items JSON
                 val itemsBytes = itemsJson.toString().toByteArray(Charsets.UTF_8)
                 dos.writeInt(itemsBytes.size)
                 dos.write(itemsBytes)
 
-                // Blobs count & binary content
                 dos.writeInt(validItems.size)
                 val buf = ByteArray(16384)
                 for ((item, blobFile) in validItems) {

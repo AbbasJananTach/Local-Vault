@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -38,18 +39,22 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Photo
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Unpublished
+import com.example.data.VaultStorage
+
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -122,6 +127,7 @@ fun HomeScreen(
     items: List<VaultItem>,
     folders: List<FolderItem>,
     vaultBlobsDir: File,
+    vaultStorage: VaultStorage,
     masterKey: SecretKey,
     isDecoyMode: Boolean,
     defaultGridColumns: Int,
@@ -129,6 +135,7 @@ fun HomeScreen(
     isImporting: Boolean,
     importProgressText: String,
     onImportFilesSelected: (targetFolderId: Long?) -> Unit,
+    onImportDirectFiles: (paths: List<String>, targetFolderId: Long?) -> Unit,
     onCreateFolder: (name: String, isLocked: Boolean, lockType: String, customPin: String?) -> Unit,
     onDeleteFolder: (FolderItem) -> Unit,
     onVerifyFolderAccess: (FolderItem, String) -> Boolean,
@@ -151,6 +158,7 @@ fun HomeScreen(
     var sortMode by remember { mutableStateOf(SortMode.NEWEST) }
     var columnCount by remember(defaultGridColumns) { mutableIntStateOf(defaultGridColumns) }
     var showPlusBottomSheet by remember { mutableStateOf(false) }
+    var showDeviceBrowserSheet by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var showMoveToFolderDialog by remember { mutableStateOf(false) }
     var showSortMenu by remember { mutableStateOf(false) }
@@ -516,7 +524,10 @@ fun HomeScreen(
                 if (isSelectionMode) {
                     Surface(
                         shadowElevation = 12.dp,
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .navigationBarsPadding()
                     ) {
                         val selectedList = items.filter { it.id in selectedItemIds }
                         Row(
@@ -599,7 +610,8 @@ fun HomeScreen(
                     }
                 } else {
                     NavigationBar(
-                        containerColor = MaterialTheme.colorScheme.surface
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        modifier = Modifier.navigationBarsPadding()
                     ) {
                         NavigationBarItem(
                             selected = currentTab == NavTab.HOME && openedFolder == null,
@@ -909,7 +921,12 @@ fun HomeScreen(
             onDismissRequest = { showPlusBottomSheet = false },
             containerColor = MaterialTheme.colorScheme.surfaceVariant
         ) {
-            Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 24.dp, vertical = 16.dp)
+            ) {
                 Text(
                     text = if (openedFolder != null) "Add to '${openedFolder!!.folderName}'" else "Add to Local Vault",
                     style = MaterialTheme.typography.titleLarge,
@@ -917,6 +934,53 @@ fun HomeScreen(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
+                // Option 1: Direct In-App Device Media Browser (Instant Guaranteed Delete)
+                Card(
+                    onClick = {
+                        showPlusBottomSheet = false
+                        showDeviceBrowserSheet = true
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("browse_device_media_option"),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.PhotoLibrary, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Browse Device Media", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(MaterialTheme.colorScheme.primaryContainer)
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        "INSTANT WIPE",
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                            Text(
+                                "Direct filesystem browser with guaranteed instant deletion of original files",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Option 2: System File Picker
                 Card(
                     onClick = {
                         showPlusBottomSheet = false
@@ -931,13 +995,13 @@ fun HomeScreen(
                         modifier = Modifier.padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Photo, null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.FolderOpen, null, tint = MaterialTheme.colorScheme.secondary)
                         Spacer(modifier = Modifier.width(16.dp))
                         Column {
-                            Text("Import Photos & Videos", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Text("System File Picker (SAF)", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
                             Text(
-                                if (openedFolder != null) "Encrypt directly into '${openedFolder!!.folderName}'"
-                                else "Select single or multiple media files from device",
+                                if (openedFolder != null) "Select files to encrypt into '${openedFolder!!.folderName}'"
+                                else "Select via Android's system document or photo picker",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -947,6 +1011,7 @@ fun HomeScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                // Option 3: Create New Folder
                 Card(
                     onClick = {
                         showPlusBottomSheet = false
@@ -961,7 +1026,7 @@ fun HomeScreen(
                         modifier = Modifier.padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.CreateNewFolder, null, tint = MaterialTheme.colorScheme.secondary)
+                        Icon(Icons.Default.CreateNewFolder, null, tint = MaterialTheme.colorScheme.tertiary)
                         Spacer(modifier = Modifier.width(16.dp))
                         Column {
                             Text("Create New Folder", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
@@ -973,9 +1038,21 @@ fun HomeScreen(
                         }
                     }
                 }
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
             }
         }
+    }
+
+    // In-App Device Media Browser Sheet
+    if (showDeviceBrowserSheet) {
+        DeviceMediaBrowserSheet(
+            vaultStorage = vaultStorage,
+            targetFolderName = openedFolder?.folderName,
+            onDismiss = { showDeviceBrowserSheet = false },
+            onImportFiles = { paths ->
+                onImportDirectFiles(paths, openedFolder?.id)
+            }
+        )
     }
 
     // Create New Folder Dialog (with Main PIN vs Custom PIN support)
