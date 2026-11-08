@@ -95,7 +95,6 @@ class VaultHeaderManager(private val context: Context) {
         }
 
         headerFile.writeText(json.toString())
-        Log.i("VaultHeader", "Vault Header created successfully at ${headerFile.absolutePath}")
         return masterKey
     }
 

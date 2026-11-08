@@ -6,11 +6,11 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.FileObserver
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.data.VaultStorage
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +23,13 @@ import java.io.File
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 
+/**
+ * Architectural & Privacy Hardening:
+ * 1. Specifies `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC` on Android 14+ (API 34+) inside a
+ *    `try-catch` block so foreground promotion never throws `MissingForegroundServiceTypeException`
+ *    or `ForegroundServiceStartNotAllowedException`.
+ * 2. Zero Logcat logging of private file names or filesystem paths.
+ */
 class AutoHideService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -37,6 +44,7 @@ class AutoHideService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForegroundServiceNotification()
         val watchedPaths = intent?.getStringArrayExtra("WATCHED_PATHS") ?: emptyArray()
         val targetFolderId = intent?.getLongExtra("TARGET_FOLDER_ID", -1L)?.let { if (it == -1L) null else it }
         val isDecoy = intent?.getBooleanExtra("IS_DECOY", false) ?: false
@@ -73,7 +81,14 @@ class AutoHideService : Service() {
             .setOngoing(true)
             .build()
 
-        startForeground(1001, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(1001, notification)
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun setupFileObservers(paths: Array<String>, targetFolderId: Long?, isDecoy: Boolean) {
@@ -146,9 +161,7 @@ class AutoHideService : Service() {
                 masterKey = key,
                 isDecoy = isDecoy
             )
-            Log.i("AutoHideService", "Auto-hidden file: ${file.absolutePath}")
-        } catch (e: Exception) {
-            Log.e("AutoHideService", "Failed to auto-hide file", e)
+        } catch (_: Exception) {
         }
     }
 

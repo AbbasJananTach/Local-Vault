@@ -6,7 +6,6 @@ import com.example.ui.theme.VaultThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.File
 
 enum class AutoLockMode(val label: String, val timeoutMs: Long) {
     IMMEDIATE("Immediately on Minimize", 0L),
@@ -38,6 +37,16 @@ class VaultPreferences(context: Context) {
         prefs.getBoolean(KEY_BRUTE_FORCE_LOCKOUT, true)
     )
     val bruteForceLockoutEnabled: StateFlow<Boolean> = _bruteForceLockoutEnabled.asStateFlow()
+
+    /**
+     * Privacy & Security Hardening:
+     * Enabled by default (`true`) to apply `WindowManager.LayoutParams.FLAG_SECURE`,
+     * preventing screenshots, screen recording, and Recent Apps thumbnail leakage.
+     */
+    private val _blockScreenshots = MutableStateFlow(
+        prefs.getBoolean(KEY_BLOCK_SCREENSHOTS, true)
+    )
+    val blockScreenshots: StateFlow<Boolean> = _blockScreenshots.asStateFlow()
 
     private val _defaultGridColumns = MutableStateFlow(
         prefs.getInt(KEY_DEFAULT_GRID_COLUMNS, 3).coerceIn(2, 5)
@@ -72,6 +81,11 @@ class VaultPreferences(context: Context) {
     fun setBruteForceLockoutEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_BRUTE_FORCE_LOCKOUT, enabled).apply()
         _bruteForceLockoutEnabled.value = enabled
+    }
+
+    fun setBlockScreenshots(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_BLOCK_SCREENSHOTS, enabled).apply()
+        _blockScreenshots.value = enabled
     }
 
     fun setDefaultGridColumns(columns: Int) {
@@ -114,6 +128,7 @@ class VaultPreferences(context: Context) {
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_AUTO_LOCK_MODE = "auto_lock_mode"
         private const val KEY_BRUTE_FORCE_LOCKOUT = "brute_force_lockout"
+        private const val KEY_BLOCK_SCREENSHOTS = "block_screenshots"
         private const val KEY_DEFAULT_GRID_COLUMNS = "default_grid_columns"
         private const val KEY_SHOW_FILE_NAMES = "show_file_names"
         private const val KEY_AUTO_HIDE_ENABLED = "auto_hide_enabled"

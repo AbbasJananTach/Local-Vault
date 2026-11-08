@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
-import android.util.Log
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -12,14 +11,21 @@ import com.example.crypto.CryptoEngine
 import com.example.data.db.VaultItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
 import javax.crypto.Cipher
+import javax.crypto.CipherInputStream
 import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 
+/**
+ * Architectural Memory Fix:
+ * Replaces full-file `ByteArrayOutputStream` RAM buffering with two-pass streaming `CipherInputStream`
+ * decoding (`inJustDecodeBounds = true` header pass followed by sampled `BitmapFactory.decodeStream`).
+ * This prevents `OutOfMemoryError` when generating grid thumbnails or viewing 50MP+ photos.
+ */
 object ThumbnailCacheManager {
     private const val MAX_CACHE_ENTRIES = 160
 
@@ -54,8 +60,7 @@ object ThumbnailCacheManager {
             } else {
                 decodeEncryptedImageThumbnail(blobFile, masterKey, baseIv)
             }
-        } catch (e: Exception) {
-            Log.w("ThumbnailCache", "Failed to decode thumbnail for ${item.fileName}", e)
+        } catch (_: Exception) {
             null
         }
 
@@ -69,27 +74,26 @@ object ThumbnailCacheManager {
         return@withContext null
     }
 
+    /**
+     * Streams the encrypted image through `CipherInputStream` in two passes:
+     * Pass 1 reads only the image header to determine dimensions (`inJustDecodeBounds = true`).
+     * Pass 2 decodes a downsampled `RGB_565` bitmap directly from the stream without holding the
+     * full decrypted file in heap memory.
+     */
     private fun decodeEncryptedImageThumbnail(
         blobFile: File,
         masterKey: SecretKey,
         baseIv: ByteArray
     ): Bitmap? {
-        val output = ByteArrayOutputStream()
-        FileInputStream(blobFile).use { input ->
-            CryptoEngine.decryptStreamCtr(
-                inputStream = input,
-                outputStream = output,
-                secretKey = masterKey,
-                baseIv = baseIv
-            )
-        }
-        val bytes = output.toByteArray()
-        if (bytes.isEmpty()) return null
-
         val boundsOptions = BitmapFactory.Options().apply {
             inJustDecodeBounds = true
         }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+
+        createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+            BitmapFactory.decodeStream(stream, null, boundsOptions)
+        }
+
+        if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return null
 
         val targetSize = 320
         var sampleSize = 1
@@ -103,7 +107,62 @@ object ThumbnailCacheManager {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.RGB_565
         }
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)
+
+        return createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+            BitmapFactory.decodeStream(stream, null, decodeOptions)
+        }
+    }
+
+    /**
+     * Decodes a high-resolution photo asynchronously on `Dispatchers.IO` using two-pass streaming
+     * `CipherInputStream` with a safe maximum dimension cap (`maxDimension = 2560`) so high-res
+     * camera photos render crisply without freezing the UI or exhausting RAM.
+     */
+    suspend fun decodeFullPhotoAsync(
+        blobFile: File,
+        masterKey: SecretKey,
+        baseIv: ByteArray,
+        maxDimension: Int = 2560
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        if (!blobFile.exists() || blobFile.length() == 0L) return@withContext null
+        try {
+            val boundsOptions = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            }
+
+            if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return@withContext null
+
+            var sampleSize = 1
+            while (boundsOptions.outWidth / sampleSize > maxDimension ||
+                boundsOptions.outHeight / sampleSize > maxDimension
+            ) {
+                sampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+
+            createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun createDecryptStream(
+        blobFile: File,
+        masterKey: SecretKey,
+        baseIv: ByteArray
+    ): BufferedInputStream {
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(baseIv))
+        return BufferedInputStream(CipherInputStream(FileInputStream(blobFile), cipher), 16384)
     }
 
     private fun decodeEncryptedVideoThumbnail(
@@ -165,8 +224,7 @@ object ThumbnailCacheManager {
             } else {
                 null
             }
-        } catch (e: Exception) {
-            Log.w("ThumbnailCache", "Video thumbnail extraction failed", e)
+        } catch (_: Exception) {
             null
         } finally {
             try {

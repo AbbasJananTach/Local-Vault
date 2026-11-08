@@ -90,6 +90,8 @@ fun SettingsScreen(
     hasDecoyPin: Boolean,
     bruteForceLockoutEnabled: Boolean,
     onToggleBruteForceLockout: (Boolean) -> Unit,
+    blockScreenshots: Boolean = true,
+    onToggleBlockScreenshots: (Boolean) -> Unit = {},
     // Auto-Lock
     autoLockMode: AutoLockMode,
     onAutoLockModeChanged: (AutoLockMode) -> Unit,
@@ -448,6 +450,31 @@ fun SettingsScreen(
                         Switch(
                             checked = bruteForceLockoutEnabled,
                             onCheckedChange = onToggleBruteForceLockout
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Block Screenshots & Screen Recording (FLAG_SECURE)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Block Screenshots & Recording", fontWeight = FontWeight.Medium)
+                            Text(
+                                "Enforce FLAG_SECURE to prevent screenshots, screen recording, and Recent Apps previews",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = blockScreenshots,
+                            onCheckedChange = onToggleBlockScreenshots,
+                            modifier = Modifier.testTag("toggle_flag_secure")
                         )
                     }
                 }

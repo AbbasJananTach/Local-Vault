@@ -82,6 +82,7 @@ import androidx.media3.common.Player
 import androidx.media3.datasource.DataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.data.db.VaultItem
@@ -138,7 +139,12 @@ fun VideoPlayerScreen(
             .setMimeType(vaultItem.mimeType.ifBlank { "video/mp4" })
             .build()
 
-        val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+        // Architectural Fix: Provide DefaultExtractorsFactory with constant bitrate seeking enabled
+        // so encrypted .bin blobs (MP4, MKV, MOV, WebM) sniff container headers and seek smoothly.
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+
+        val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
             .createMediaSource(mediaItem)
 
         ExoPlayer.Builder(context).build().apply {

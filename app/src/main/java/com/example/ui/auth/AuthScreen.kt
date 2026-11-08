@@ -354,17 +354,26 @@ fun AuthScreen(
     }
 }
 
+/**
+ * Dynamic PIN Dots Indicator:
+ * Expands from 6 baseline dots up to 10 dots as the user enters 7–10 digits,
+ * with adaptive sizing and spacing so every digit from 1 to 10 provides immediate visual feedback.
+ */
 @Composable
 fun PinDotsDisplay(pinLength: Int) {
+    val totalDots = maxOf(6, pinLength).coerceAtMost(10)
+    val dotSize = if (totalDots > 7) 13.dp else 16.dp
+    val dotSpacing = if (totalDots > 7) 8.dp else 12.dp
+
     Row(
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(dotSpacing),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        repeat(6) { index ->
+        repeat(totalDots) { index ->
             val isFilled = index < pinLength
             Box(
                 modifier = Modifier
-                    .size(16.dp)
+                    .size(if (isFilled) dotSize else dotSize * 0.85f)
                     .clip(CircleShape)
                     .background(
                         if (isFilled) MaterialTheme.colorScheme.primary

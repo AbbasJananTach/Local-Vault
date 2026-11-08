@@ -103,6 +103,7 @@ dependencies {
   implementation(libs.androidx.room.runtime)
   implementation(libs.coil.compose)
   implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.extractor)
   implementation(libs.androidx.media3.ui)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)

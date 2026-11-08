@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -56,7 +58,7 @@ sealed class Screen {
     object Auth : Screen()
     object Home : Screen()
     data class VideoPlayer(val item: VaultItem) : Screen()
-    data class PhotoViewer(val item: VaultItem) : Screen()
+    data class PhotoViewer(val initialItemId: Long, val photoIds: List<Long>) : Screen()
     object Settings : Screen()
 }
 
@@ -69,6 +71,7 @@ class MainActivity : ComponentActivity() {
 
     private var masterKey: SecretKey? = null
     private var isDecoyVault by mutableStateOf(false)
+    private var dbRefreshTick by mutableIntStateOf(0)
 
     private val currentScreen = mutableStateOf<Screen>(Screen.Auth)
 
@@ -135,6 +138,9 @@ class MainActivity : ComponentActivity() {
                 isImporting.value = false
                 result.onSuccess { count ->
                     ThumbnailCacheManager.clearCache()
+                    masterKey?.let { key ->
+                        vaultStorage.syncEncryptedCatalog(key)
+                    }
                     Toast.makeText(
                         this@MainActivity,
                         "Restored $count encrypted items to Vault",
@@ -168,6 +174,8 @@ class MainActivity : ComponentActivity() {
         database = VaultDatabase.getInstance(this)
         vaultPrefs = VaultPreferences(this)
 
+        applyFlagSecure(vaultPrefs.blockScreenshots.value)
+
         registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
 
         checkStoragePermissions()
@@ -176,10 +184,15 @@ class MainActivity : ComponentActivity() {
             val themeMode by vaultPrefs.themeMode.collectAsState()
             val autoLockMode by vaultPrefs.autoLockMode.collectAsState()
             val bruteForceLockoutEnabled by vaultPrefs.bruteForceLockoutEnabled.collectAsState()
+            val blockScreenshots by vaultPrefs.blockScreenshots.collectAsState()
             val defaultGridColumns by vaultPrefs.defaultGridColumns.collectAsState()
             val showFileNamesOnGrid by vaultPrefs.showFileNamesOnGrid.collectAsState()
             val isAutoHideEnabled by vaultPrefs.autoHideEnabled.collectAsState()
             val watchedFolders by vaultPrefs.watchedFolders.collectAsState()
+
+            LaunchedEffect(blockScreenshots) {
+                applyFlagSecure(blockScreenshots)
+            }
 
             MyApplicationTheme(themeMode = themeMode, dynamicColor = false) {
                 Surface(
@@ -187,28 +200,33 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val scope = rememberCoroutineScope()
-                    val dao = database.vaultDao()
-                    val folderDao = database.folderDao()
+                    val activeDb = remember(dbRefreshTick) {
+                        VaultDatabase.getInstance(this@MainActivity).also { database = it }
+                    }
+                    val dao = remember(activeDb) { activeDb.vaultDao() }
+                    val folderDao = remember(activeDb) { activeDb.folderDao() }
 
                     val items by dao.getAllItems(isDecoy = isDecoyVault).collectAsState(initial = emptyList())
                     val folders by folderDao.getAllFolders(isDecoy = isDecoyVault).collectAsState(initial = emptyList())
 
                     // Trigger recomposition for lockout status & security status
                     var authAttemptTick by remember { mutableIntStateOf(0) }
-                    val lockoutStatus = remember(authAttemptTick, bruteForceLockoutEnabled) {
+                    val lockoutStatus = remember(authAttemptTick, bruteForceLockoutEnabled, dbRefreshTick) {
                         headerManager.getLockoutStatus(bruteForceLockoutEnabled)
                     }
-                    var hasDecoyState by remember(authAttemptTick) {
+                    var hasDecoyState by remember(authAttemptTick, dbRefreshTick) {
                         mutableStateOf(headerManager.hasDecoyPin())
                     }
-                    var hasRecoveryState by remember(authAttemptTick) {
+                    var hasRecoveryState by remember(authAttemptTick, dbRefreshTick) {
                         mutableStateOf(headerManager.hasRecoveryPhrase())
                     }
 
                     when (val screen = currentScreen.value) {
                         is Screen.Auth -> {
                             AuthScreen(
-                                isInitialized = headerManager.isVaultInitialized(),
+                                isInitialized = remember(authAttemptTick, dbRefreshTick) {
+                                    headerManager.isVaultInitialized()
+                                },
                                 isLockedOut = lockoutStatus.isLockedOut,
                                 lockoutRemainingSeconds = lockoutStatus.remainingSeconds,
                                 onPinSubmit = { pin ->
@@ -222,6 +240,11 @@ class MainActivity : ComponentActivity() {
                                             masterKey = key
                                             isDecoyVault = false
                                             currentScreen.value = Screen.Home
+                                            if (key != null) {
+                                                scope.launch(Dispatchers.IO) {
+                                                    vaultStorage.reconcileAndRecoverCatalog(key)
+                                                }
+                                            }
                                             if (isAutoHideEnabled) {
                                                 syncAutoHideService(true, watchedFolders)
                                             }
@@ -230,6 +253,11 @@ class MainActivity : ComponentActivity() {
                                             masterKey = key
                                             isDecoyVault = true
                                             currentScreen.value = Screen.Home
+                                            if (key != null) {
+                                                scope.launch(Dispatchers.IO) {
+                                                    vaultStorage.reconcileAndRecoverCatalog(key)
+                                                }
+                                            }
                                         }
                                         AuthResult.LOCKED_OUT -> {
                                             Toast.makeText(
@@ -253,6 +281,9 @@ class MainActivity : ComponentActivity() {
                                     isDecoyVault = false
                                     authAttemptTick++
                                     currentScreen.value = Screen.Home
+                                    scope.launch(Dispatchers.IO) {
+                                        vaultStorage.reconcileAndRecoverCatalog(key)
+                                    }
                                 },
                                 onRecoveryPhraseSubmit = { phrase ->
                                     val (success, key) = headerManager.authenticateRecoveryPhrase(phrase)
@@ -261,6 +292,9 @@ class MainActivity : ComponentActivity() {
                                         masterKey = key
                                         isDecoyVault = false
                                         currentScreen.value = Screen.Home
+                                        scope.launch(Dispatchers.IO) {
+                                            vaultStorage.reconcileAndRecoverCatalog(key)
+                                        }
                                         true
                                     } else false
                                 },
@@ -313,6 +347,7 @@ class MainActivity : ComponentActivity() {
                                                     isDecoy = isDecoyVault
                                                 )
                                             )
+                                            vaultStorage.syncEncryptedCatalog(activeKey)
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     this@MainActivity,
@@ -327,6 +362,7 @@ class MainActivity : ComponentActivity() {
                                             val folderItems = dao.getItemsInFolderSync(folder.id, isDecoyVault)
                                             folderItems.forEach { vaultStorage.deletePermanently(it) }
                                             folderDao.deleteFolder(folder)
+                                            vaultStorage.syncEncryptedCatalog(activeKey)
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     this@MainActivity,
@@ -350,16 +386,24 @@ class MainActivity : ComponentActivity() {
                                     onVerifyRecoveryPhrase = { phrase ->
                                         headerManager.authenticateRecoveryPhrase(phrase).first
                                     },
-                                    onItemClick = { item ->
+                                    onItemClick = { item, displayedItems ->
                                         if (item.mimeType.startsWith("video")) {
                                             currentScreen.value = Screen.VideoPlayer(item)
                                         } else {
-                                            currentScreen.value = Screen.PhotoViewer(item)
+                                            val photoIds = displayedItems
+                                                .filter { !it.mimeType.startsWith("video") }
+                                                .map { it.id }
+                                                .ifEmpty { listOf(item.id) }
+                                            currentScreen.value = Screen.PhotoViewer(
+                                                initialItemId = item.id,
+                                                photoIds = photoIds
+                                            )
                                         }
                                     },
                                     onDeleteSelectedItems = { selectedItems ->
                                         scope.launch(Dispatchers.IO) {
                                             selectedItems.forEach { vaultStorage.deletePermanently(it) }
+                                            vaultStorage.syncEncryptedCatalog(activeKey)
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     this@MainActivity,
@@ -389,8 +433,11 @@ class MainActivity : ComponentActivity() {
                                     onToggleFavoriteSelected = { selectedItems ->
                                         scope.launch(Dispatchers.IO) {
                                             selectedItems.forEach {
-                                                dao.updateItem(it.copy(isFavorite = !it.isFavorite))
+                                                val updated = it.copy(isFavorite = !it.isFavorite)
+                                                dao.updateItem(updated)
+                                                vaultStorage.writeSidecarMetadata(updated, activeKey)
                                             }
+                                            vaultStorage.syncEncryptedCatalog(activeKey)
                                         }
                                     },
                                     onMoveSelectedItemsToFolder = { selectedItems, targetFolderId ->
@@ -399,6 +446,13 @@ class MainActivity : ComponentActivity() {
                                                 ids = selectedItems.map { it.id },
                                                 targetFolderId = targetFolderId
                                             )
+                                            selectedItems.forEach {
+                                                vaultStorage.writeSidecarMetadata(
+                                                    it.copy(folderId = targetFolderId),
+                                                    activeKey
+                                                )
+                                            }
+                                            vaultStorage.syncEncryptedCatalog(activeKey)
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     this@MainActivity,
@@ -431,17 +485,23 @@ class MainActivity : ComponentActivity() {
                         }
 
                         is Screen.PhotoViewer -> {
-                            val blobFile = File(vaultStorage.vaultBlobsDir, screen.item.encryptedRelativePath)
-                            val baseIv = fromHex(screen.item.baseIvHex)
                             masterKey?.let { key ->
+                                val itemMap = remember(items) { items.associateBy { it.id } }
+                                val orderedPhotos = remember(screen.photoIds, itemMap) {
+                                    screen.photoIds.mapNotNull { itemMap[it] }
+                                }
                                 PhotoViewerScreen(
-                                    vaultItem = screen.item,
-                                    blobFile = blobFile,
-                                    baseIv = baseIv,
+                                    photoItems = orderedPhotos,
+                                    initialItemId = screen.initialItemId,
+                                    vaultBlobsDir = vaultStorage.vaultBlobsDir,
                                     masterKey = key,
                                     onBack = { currentScreen.value = Screen.Home },
                                     onToggleFavorite = { item ->
-                                        scope.launch(Dispatchers.IO) { dao.updateItem(item) }
+                                        scope.launch(Dispatchers.IO) {
+                                            dao.updateItem(item)
+                                            vaultStorage.writeSidecarMetadata(item, key)
+                                            vaultStorage.syncEncryptedCatalog(key)
+                                        }
                                     },
                                     onUnhide = { item ->
                                         scope.launch(Dispatchers.IO) {
@@ -452,20 +512,24 @@ class MainActivity : ComponentActivity() {
                                                     "Restored '${item.fileName}'",
                                                     Toast.LENGTH_SHORT
                                                 ).show()
-                                                currentScreen.value = Screen.Home
+                                                if (orderedPhotos.size <= 1) {
+                                                    currentScreen.value = Screen.Home
+                                                }
                                             }
                                         }
                                     },
                                     onDelete = { item ->
                                         scope.launch(Dispatchers.IO) {
-                                            vaultStorage.deletePermanently(item)
+                                            vaultStorage.deletePermanently(item, key)
                                             withContext(Dispatchers.Main) {
                                                 Toast.makeText(
                                                     this@MainActivity,
                                                     "Deleted '${item.fileName}'",
                                                     Toast.LENGTH_SHORT
                                                 ).show()
-                                                currentScreen.value = Screen.Home
+                                                if (orderedPhotos.size <= 1) {
+                                                    currentScreen.value = Screen.Home
+                                                }
                                             }
                                         }
                                     }
@@ -515,6 +579,11 @@ class MainActivity : ComponentActivity() {
                                 bruteForceLockoutEnabled = bruteForceLockoutEnabled,
                                 onToggleBruteForceLockout = { enabled ->
                                     vaultPrefs.setBruteForceLockoutEnabled(enabled)
+                                },
+                                blockScreenshots = blockScreenshots,
+                                onToggleBlockScreenshots = { enabled ->
+                                    vaultPrefs.setBlockScreenshots(enabled)
+                                    applyFlagSecure(enabled)
                                 },
                                 autoLockMode = autoLockMode,
                                 onAutoLockModeChanged = { mode ->
@@ -571,6 +640,17 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun applyFlagSecure(enabled: Boolean) {
+        if (enabled) {
+            window.setFlags(
+                WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE
+            )
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         }
     }
 
@@ -730,6 +810,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Re-check persistent external database path after returning from permission settings
+        database = VaultDatabase.getInstance(this)
+        dbRefreshTick++
+
         if (isLaunchingExternalPicker) {
             isLaunchingExternalPicker = false
             backgroundedElapsedTime = 0L

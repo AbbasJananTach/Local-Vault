@@ -57,6 +57,7 @@ import com.example.data.VaultStorage
 
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -140,7 +141,7 @@ fun HomeScreen(
     onDeleteFolder: (FolderItem) -> Unit,
     onVerifyFolderAccess: (FolderItem, String) -> Boolean,
     onVerifyRecoveryPhrase: (String) -> Boolean,
-    onItemClick: (VaultItem) -> Unit,
+    onItemClick: (VaultItem, List<VaultItem>) -> Unit,
     onDeleteSelectedItems: (List<VaultItem>) -> Unit,
     onUnhideSelectedItems: (List<VaultItem>) -> Unit,
     onToggleFavoriteSelected: (List<VaultItem>) -> Unit,
@@ -169,9 +170,11 @@ fun HomeScreen(
     var pendingPinFolder by remember { mutableStateOf<FolderItem?>(null) }
     var pendingActionAfterPin by remember { mutableStateOf<(() -> Unit)?>(null) }
 
-    // Multi-Selection State
+    // Multi-Selection & Delete Confirmation State
     var isSelectionMode by remember { mutableStateOf(false) }
     val selectedItemIds = remember { mutableStateListOf<Long>() }
+    var showDeleteSelectedConfirmDialog by remember { mutableStateOf(false) }
+    var folderPendingConfirmDelete by remember { mutableStateOf<FolderItem?>(null) }
 
     // Handle system Back button when inside a Folder or Selection Mode
     BackHandler(enabled = isSelectionMode || openedFolder != null) {
@@ -439,9 +442,9 @@ fun HomeScreen(
                             }
                         } else {
                             if (openedFolder != null) {
-                                // Add media directly to this open folder
+                                // Primary action: Launch In-App Device Media Browser for 100% instant wipe into this folder
                                 IconButton(
-                                    onClick = { onImportFilesSelected(openedFolder!!.id) },
+                                    onClick = { showDeviceBrowserSheet = true },
                                     modifier = Modifier.testTag("folder_add_media_button")
                                 ) {
                                     Icon(
@@ -450,13 +453,12 @@ fun HomeScreen(
                                         tint = MaterialTheme.colorScheme.primary
                                     )
                                 }
-                                // Delete this folder
+                                // Delete this folder (with confirmation dialog)
                                 IconButton(
                                     onClick = {
                                         val folderToDelete = openedFolder!!
                                         requestFolderPinGate(folderToDelete) {
-                                            openedFolder = null
-                                            onDeleteFolder(folderToDelete)
+                                            folderPendingConfirmDelete = folderToDelete
                                         }
                                     },
                                     modifier = Modifier.testTag("delete_folder_button")
@@ -590,9 +592,7 @@ fun HomeScreen(
                                 modifier = Modifier
                                     .clickable {
                                         val action = {
-                                            onDeleteSelectedItems(selectedList)
-                                            isSelectionMode = false
-                                            selectedItemIds.clear()
+                                            showDeleteSelectedConfirmDialog = true
                                         }
                                         if (openedFolder != null && openedFolder!!.isLocked) {
                                             requestFolderPinGate(openedFolder!!, action)
@@ -804,7 +804,7 @@ fun HomeScreen(
                                     },
                                     onLongClick = {
                                         requestFolderPinGate(folder) {
-                                            onDeleteFolder(folder)
+                                            folderPendingConfirmDelete = folder
                                         }
                                     }
                                 )
@@ -859,12 +859,21 @@ fun HomeScreen(
                             )
                             Spacer(modifier = Modifier.height(20.dp))
                             Button(
-                                onClick = { onImportFilesSelected(openedFolder?.id) },
+                                onClick = { showDeviceBrowserSheet = true },
                                 modifier = Modifier.testTag("empty_add_media_button")
                             ) {
-                                Icon(Icons.Default.Add, contentDescription = null)
+                                Icon(Icons.Default.PhotoLibrary, contentDescription = null)
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Text(if (openedFolder != null) "Add Media to Folder" else "Add Media")
+                                Text(if (openedFolder != null) "Add Media to Folder (Instant Wipe)" else "Add Media (Instant Wipe)")
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            TextButton(
+                                onClick = { onImportFilesSelected(openedFolder?.id) },
+                                modifier = Modifier.testTag("empty_saf_picker_button")
+                            ) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Or Use System File Picker (SAF)", fontSize = 12.sp)
                             }
                         }
                     }
@@ -894,7 +903,7 @@ fun HomeScreen(
                                         if (isSelected) selectedItemIds.remove(vaultItem.id)
                                         else selectedItemIds.add(vaultItem.id)
                                     } else {
-                                        onItemClick(vaultItem)
+                                        onItemClick(vaultItem, displayedItems)
                                     }
                                 },
                                 onLongClick = {
@@ -1323,6 +1332,72 @@ fun HomeScreen(
             },
             confirmButton = {
                 TextButton(onClick = { showMoveToFolderDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Confirmation Dialog before deleting selected items
+    if (showDeleteSelectedConfirmDialog) {
+        val selectedList = items.filter { it.id in selectedItemIds }
+        AlertDialog(
+            onDismissRequest = { showDeleteSelectedConfirmDialog = false },
+            title = { Text("Delete ${selectedList.size} Item(s) Permanently?", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Are you sure you want to permanently destroy ${selectedList.size} selected media item(s) from your encrypted vault? This action cannot be undone."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteSelectedConfirmDialog = false
+                        onDeleteSelectedItems(selectedList)
+                        isSelectionMode = false
+                        selectedItemIds.clear()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete Forever")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteSelectedConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Confirmation Dialog before deleting a folder and all its contents
+    if (folderPendingConfirmDelete != null) {
+        val folderToDelete = folderPendingConfirmDelete!!
+        val countInFolder = items.count { it.folderId == folderToDelete.id }
+        AlertDialog(
+            onDismissRequest = { folderPendingConfirmDelete = null },
+            title = { Text("Delete Folder '${folderToDelete.folderName}'?", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "This will permanently delete the folder '${folderToDelete.folderName}' and all $countInFolder encrypted media file(s) inside it. This action cannot be undone."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        folderPendingConfirmDelete = null
+                        if (openedFolder?.id == folderToDelete.id) {
+                            openedFolder = null
+                        }
+                        onDeleteFolder(folderToDelete)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete Folder")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { folderPendingConfirmDelete = null }) {
                     Text("Cancel")
                 }
             }
