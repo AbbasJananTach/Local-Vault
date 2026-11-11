@@ -40,7 +40,14 @@ data class DeviceMediaItem(
     val size: Long,
     val dateModified: Long,
     val isVideo: Boolean,
-    val folderName: String
+    val folderName: String,
+    val durationMs: Long = 0L
+)
+
+data class DeviceFolderSummary(
+    val name: String,
+    val path: String,
+    val mediaCount: Int
 )
 
 class VaultStorage(private val context: Context) {
@@ -76,7 +83,7 @@ class VaultStorage(private val context: Context) {
         get() = File(vaultRootDir, "vault_catalog.enc")
 
     /**
-     * Queries all device media files directly from MediaStore with real filesystem paths.
+     * Queries all device media files directly from MediaStore with real filesystem paths and durations.
      * Excludes anything already inside the .LocalVaultData folder.
      */
     suspend fun queryDeviceMediaFiles(folderFilter: String? = null): List<DeviceMediaItem> = withContext(Dispatchers.IO) {
@@ -88,7 +95,8 @@ class VaultStorage(private val context: Context) {
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.DATE_MODIFIED,
             MediaStore.Files.FileColumns.MEDIA_TYPE,
-            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME
+            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
+            MediaStore.Video.Media.DURATION
         )
 
         val selection = "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?)" +
@@ -116,6 +124,7 @@ class VaultStorage(private val context: Context) {
                 val dateCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
                 val typeCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
                 val bucketCol = cursor.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
+                val durCol = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
 
                 while (cursor.moveToNext()) {
                     val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
@@ -128,6 +137,7 @@ class VaultStorage(private val context: Context) {
                             val size = if (sizeCol != -1) cursor.getLong(sizeCol) else file.length()
                             val dateMod = if (dateCol != -1) cursor.getLong(dateCol) * 1000L else file.lastModified()
                             val isVideo = if (typeCol != -1) cursor.getInt(typeCol) == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO else false
+                            val durationMs = if (isVideo && durCol != -1 && !cursor.isNull(durCol)) cursor.getLong(durCol) else 0L
 
                             result.add(
                                 DeviceMediaItem(
@@ -137,7 +147,8 @@ class VaultStorage(private val context: Context) {
                                     size = size,
                                     dateModified = dateMod,
                                     isVideo = isVideo,
-                                    folderName = folderName
+                                    folderName = folderName,
+                                    durationMs = durationMs
                                 )
                             )
                         }
@@ -187,6 +198,127 @@ class VaultStorage(private val context: Context) {
         } catch (_: Exception) {
         }
         return@withContext folders.sorted()
+    }
+
+    /**
+     * Discovers all device folders/albums with their real filesystem directory paths and media counts
+     * for the Interactive Visual Folder Picker in Settings.
+     */
+    suspend fun queryAllDeviceMediaFoldersWithPaths(): List<DeviceFolderSummary> = withContext(Dispatchers.IO) {
+        val pathMap = linkedMapOf<String, Pair<String, Int>>()
+
+        // 1. Add standard preset folders first so they are always selectable even when currently empty
+        VaultPreferences.getPresetWatchableFolders().forEach { (label, dirPath) ->
+            pathMap[dirPath] = label to 0
+        }
+
+        // 2. Scan MediaStore for every folder containing images or videos on the device
+        val projection = arrayOf(
+            MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME
+        )
+        val selection = "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?)" +
+            " AND ${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%'"
+        val selectionArgs = arrayOf(
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        )
+
+        try {
+            context.contentResolver.query(
+                MediaStore.Files.getContentUri("external"),
+                projection,
+                selection,
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                val dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                val bucketCol = cursor.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val filePath = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
+                    if (filePath.isNotEmpty()) {
+                        val file = File(filePath)
+                        val parentDir = file.parentFile
+                        if (parentDir != null && !parentDir.absolutePath.contains("/.LocalVaultData")) {
+                            val dirPath = parentDir.absolutePath
+                            val bucketName = (if (bucketCol != -1) cursor.getString(bucketCol) else null)
+                                ?: parentDir.name.ifBlank { "Storage" }
+                            val existing = pathMap[dirPath]
+                            if (existing != null) {
+                                pathMap[dirPath] = existing.first to (existing.second + 1)
+                            } else {
+                                pathMap[dirPath] = bucketName to 1
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        return@withContext pathMap.map { (path, pair) ->
+            DeviceFolderSummary(
+                name = pair.first,
+                path = path,
+                mediaCount = pair.second
+            )
+        }.sortedWith(compareByDescending<DeviceFolderSummary> { it.mediaCount }.thenBy { it.name.lowercase() })
+    }
+
+    /**
+     * Lists non-hidden subdirectories inside `parentPath` for visual directory browsing in Settings.
+     */
+    suspend fun listSubdirectories(parentPath: String): List<File> = withContext(Dispatchers.IO) {
+        try {
+            val dir = File(parentPath)
+            if (!dir.exists() || !dir.isDirectory) return@withContext emptyList()
+            dir.listFiles()
+                ?.filter { it.isDirectory && !it.name.startsWith(".") }
+                ?.sortedBy { it.name.lowercase() }
+                ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Sweeps all watched folder paths and immediately encrypts & hides any media files found.
+     * Invoked both periodically by `AutoHideService` and upon Vault unlock in `MainActivity`.
+     */
+    suspend fun sweepWatchedFoldersNow(
+        watchedPaths: Set<String>,
+        masterKey: SecretKey,
+        isDecoy: Boolean = false
+    ): Int = withContext(Dispatchers.IO) {
+        var importedCount = 0
+        watchedPaths.forEach { pathStr ->
+            try {
+                val folder = File(pathStr)
+                if (folder.exists() && folder.isDirectory && !folder.absolutePath.contains("/.LocalVaultData")) {
+                    folder.listFiles()?.forEach { file ->
+                        if (file.isFile && !file.name.startsWith(".") && file.length() > 0L && isSupportedMediaFileName(file.name)) {
+                            val item = importFile(
+                                uri = Uri.fromFile(file),
+                                originalPathOverride = file.absolutePath,
+                                targetFolderId = null,
+                                masterKey = masterKey,
+                                isDecoy = isDecoy
+                            )
+                            if (item != null) {
+                                importedCount++
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return@withContext importedCount
+    }
+
+    private fun isSupportedMediaFileName(name: String): Boolean {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "mp4", "m4v", "mkv", "mov", "avi", "3gp", "webm")
     }
 
     suspend fun importFile(
@@ -998,9 +1130,11 @@ class VaultStorage(private val context: Context) {
                 dis.readFully(headerBytes)
                 val headerJsonStr = String(headerBytes, Charsets.UTF_8)
                 if (headerJsonStr.isNotBlank() && headerJsonStr != "{}") {
+                    headerFile.parentFile?.mkdirs()
                     headerFile.writeText(headerJsonStr)
                 }
 
+                // Safely merge/restore folders and items without wiping existing vault records
                 val foldersLen = dis.readInt()
                 val foldersBytes = ByteArray(foldersLen)
                 dis.readFully(foldersBytes)

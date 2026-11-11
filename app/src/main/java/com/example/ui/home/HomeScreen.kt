@@ -141,6 +141,7 @@ fun HomeScreen(
     onDeleteFolder: (FolderItem) -> Unit,
     onVerifyFolderAccess: (FolderItem, String) -> Boolean,
     onVerifyRecoveryPhrase: (String) -> Boolean,
+    onVerifyMasterPin: (String) -> Boolean = { false },
     onItemClick: (VaultItem, List<VaultItem>) -> Unit,
     onDeleteSelectedItems: (List<VaultItem>) -> Unit,
     onUnhideSelectedItems: (List<VaultItem>) -> Unit,
@@ -148,8 +149,7 @@ fun HomeScreen(
     onMoveSelectedItemsToFolder: (List<VaultItem>, Long?) -> Unit,
     onOpenSettings: () -> Unit,
     onColumnCountChanged: (Int) -> Unit,
-    usedStorageBytes: Long,
-    totalStorageBytes: Long
+    usedStorageBytes: Long
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -160,9 +160,11 @@ fun HomeScreen(
     var columnCount by remember(defaultGridColumns) { mutableIntStateOf(defaultGridColumns) }
     var showPlusBottomSheet by remember { mutableStateOf(false) }
     var showDeviceBrowserSheet by remember { mutableStateOf(false) }
+    var showVaultMediaPickerSheet by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var showMoveToFolderDialog by remember { mutableStateOf(false) }
     var showSortMenu by remember { mutableStateOf(false) }
+    var showSettingsPinGateDialog by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
     // Folder Navigation & PIN Gate State
@@ -175,6 +177,9 @@ fun HomeScreen(
     val selectedItemIds = remember { mutableStateListOf<Long>() }
     var showDeleteSelectedConfirmDialog by remember { mutableStateOf(false) }
     var folderPendingConfirmDelete by remember { mutableStateOf<FolderItem?>(null) }
+
+    val totalPhotoCount = remember(items) { items.count { !it.mimeType.startsWith("video") } }
+    val totalVideoCount = remember(items) { items.count { it.mimeType.startsWith("video") } }
 
     // Handle system Back button when inside a Folder or Selection Mode
     BackHandler(enabled = isSelectionMode || openedFolder != null) {
@@ -271,7 +276,7 @@ fun HomeScreen(
 
                     Spacer(modifier = Modifier.height(28.dp))
 
-                    // Storage Information Widget
+                    // Local Vault Media Summary Widget (100% offline local counters, no quota bar or Free storage label)
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(16.dp),
@@ -281,85 +286,66 @@ fun HomeScreen(
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "Encrypted Storage",
+                                text = "Vault Media Summary",
                                 fontWeight = FontWeight.SemiBold,
                                 style = MaterialTheme.typography.titleSmall,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(8.dp))
-                            val ratio = if (totalStorageBytes > 0) {
-                                (usedStorageBytes.toFloat() / (usedStorageBytes + totalStorageBytes).toFloat()).coerceIn(0.02f, 1f)
-                            } else 0.05f
-                            LinearProgressIndicator(
-                                progress = { ratio },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(8.dp)
-                                    .clip(RoundedCornerShape(4.dp)),
-                                color = MaterialTheme.colorScheme.primary,
-                                trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                            Text(
+                                text = "$totalPhotoCount Photos • $totalVideoCount Videos • ${folders.size} Folders",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
                             )
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "Vault: ${formatBytes(usedStorageBytes)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    text = "Free: ${formatBytes(totalStorageBytes)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "${items.size} encrypted files • ${folders.size} folders",
-                                style = MaterialTheme.typography.labelSmall,
+                                text = "Total Vault Size: ${formatBytes(usedStorageBytes)}",
+                                style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(24.dp))
+                    // Completely block & hide Control Center & Settings when logged in via Decoy PIN
+                    if (!isDecoyMode) {
+                        Spacer(modifier = Modifier.height(24.dp))
 
-                    Card(
-                        onClick = {
-                            scope.launch { drawerState.close() }
-                            onOpenSettings()
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("drawer_settings_button"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.Settings,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
+                        Card(
+                            onClick = {
+                                scope.launch { drawerState.close() }
+                                showSettingsPinGateDialog = true
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("drawer_settings_button"),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
                             )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column {
-                                Text(
-                                    "Control Center & Settings",
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurface
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Settings,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
                                 )
-                                Text(
-                                    "PIN, Themes, Auto-Lock, Backup",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column {
+                                    Text(
+                                        "Control Center & Settings",
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        "Protected by Master PIN • Themes, Backup",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         }
                     }
@@ -512,11 +498,13 @@ fun HomeScreen(
                                 }
                             }
 
-                            IconButton(
-                                onClick = onOpenSettings,
-                                modifier = Modifier.testTag("topbar_settings_button")
-                            ) {
-                                Icon(Icons.Default.Settings, "Settings")
+                            if (!isDecoyMode) {
+                                IconButton(
+                                    onClick = { showSettingsPinGateDialog = true },
+                                    modifier = Modifier.testTag("topbar_settings_button")
+                                ) {
+                                    Icon(Icons.Default.Settings, "Settings")
+                                }
                             }
                         }
                     }
@@ -850,7 +838,7 @@ fun HomeScreen(
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = if (openedFolder != null) {
-                                    "Import photos or videos directly into this encrypted folder."
+                                    "Move existing Vault items into '${openedFolder!!.folderName}' or import new media from your device."
                                 } else {
                                     "Import photos and videos from your device to encrypt them with AES-256."
                                 },
@@ -859,12 +847,18 @@ fun HomeScreen(
                             )
                             Spacer(modifier = Modifier.height(20.dp))
                             Button(
-                                onClick = { showDeviceBrowserSheet = true },
+                                onClick = {
+                                    if (openedFolder != null) {
+                                        showPlusBottomSheet = true
+                                    } else {
+                                        showDeviceBrowserSheet = true
+                                    }
+                                },
                                 modifier = Modifier.testTag("empty_add_media_button")
                             ) {
-                                Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+                                Icon(Icons.Default.Add, contentDescription = null)
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Text(if (openedFolder != null) "Add Media to Folder (Instant Wipe)" else "Add Media (Instant Wipe)")
+                                Text(if (openedFolder != null) "Add Media to Folder" else "Add Media (Instant Wipe)")
                             }
                             Spacer(modifier = Modifier.height(8.dp))
                             TextButton(
@@ -924,7 +918,7 @@ fun HomeScreen(
         }
     }
 
-    // Plus Center Button BottomSheet
+    // Plus Center Button / Folder Add Media Choice BottomSheet
     if (showPlusBottomSheet) {
         ModalBottomSheet(
             onDismissRequest = { showPlusBottomSheet = false },
@@ -937,13 +931,66 @@ fun HomeScreen(
                     .padding(horizontal = 24.dp, vertical = 16.dp)
             ) {
                 Text(
-                    text = if (openedFolder != null) "Add to '${openedFolder!!.folderName}'" else "Add to Local Vault",
+                    text = if (openedFolder != null) "Add Media to '${openedFolder!!.folderName}'" else "Add to Local Vault",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Option 1: Direct In-App Device Media Browser (Instant Guaranteed Delete)
+                // When inside an opened folder, ask: 1) From Existing Vault OR 2) From Device
+                if (openedFolder != null) {
+                    val availableVaultCount = items.count { it.folderId != openedFolder!!.id }
+                    Card(
+                        onClick = {
+                            showPlusBottomSheet = false
+                            showVaultMediaPickerSheet = true
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("add_from_vault_option"),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.DriveFileMove, null, tint = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "Add Existing Media from Vault",
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 16.sp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(MaterialTheme.colorScheme.primaryContainer)
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            "$availableVaultCount IN VAULT",
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                                Text(
+                                    "Select photos & videos already encrypted in your Vault and move them into '${openedFolder!!.folderName}'",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+
+                // Option: Direct In-App Device Media Browser (Instant Guaranteed Delete)
                 Card(
                     onClick = {
                         showPlusBottomSheet = false
@@ -962,7 +1009,11 @@ fun HomeScreen(
                         Spacer(modifier = Modifier.width(16.dp))
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Browse Device Media", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                                Text(
+                                    if (openedFolder != null) "Import New Media from Device" else "Browse Device Media",
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 16.sp
+                                )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Box(
                                     modifier = Modifier
@@ -989,7 +1040,7 @@ fun HomeScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Option 2: System File Picker
+                // Option: System File Picker
                 Card(
                     onClick = {
                         showPlusBottomSheet = false
@@ -1009,7 +1060,7 @@ fun HomeScreen(
                         Column {
                             Text("System File Picker (SAF)", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
                             Text(
-                                if (openedFolder != null) "Select files to encrypt into '${openedFolder!!.folderName}'"
+                                if (openedFolder != null) "Select external files via Android's system picker into '${openedFolder!!.folderName}'"
                                 else "Select via Android's system document or photo picker",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1018,38 +1069,59 @@ fun HomeScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                if (openedFolder == null) {
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                // Option 3: Create New Folder
-                Card(
-                    onClick = {
-                        showPlusBottomSheet = false
-                        showCreateFolderDialog = true
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("create_folder_option"),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    // Option: Create New Folder
+                    Card(
+                        onClick = {
+                            showPlusBottomSheet = false
+                            showCreateFolderDialog = true
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("create_folder_option"),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
                     ) {
-                        Icon(Icons.Default.CreateNewFolder, null, tint = MaterialTheme.colorScheme.tertiary)
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column {
-                            Text("Create New Folder", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-                            Text(
-                                "Organize media & optionally protect with a PIN lock",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.CreateNewFolder, null, tint = MaterialTheme.colorScheme.tertiary)
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text("Create New Folder", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                                Text(
+                                    "Organize media & optionally protect with a PIN lock",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
                 Spacer(modifier = Modifier.height(20.dp))
             }
         }
+    }
+
+    // In-Vault Existing Media Picker Sheet (Move existing Vault items into openedFolder)
+    if (showVaultMediaPickerSheet && openedFolder != null) {
+        val targetFolder = openedFolder!!
+        val candidateVaultItems = remember(items, targetFolder.id) {
+            items.filter { it.folderId != targetFolder.id }.sortedByDescending { it.dateAdded }
+        }
+        VaultExistingMediaPickerSheet(
+            candidateItems = candidateVaultItems,
+            targetFolderName = targetFolder.folderName,
+            vaultBlobsDir = vaultBlobsDir,
+            masterKey = masterKey,
+            onDismiss = { showVaultMediaPickerSheet = false },
+            onConfirmMove = { selectedToMove ->
+                showVaultMediaPickerSheet = false
+                onMoveSelectedItemsToFolder(selectedToMove, targetFolder.id)
+            }
+        )
     }
 
     // In-App Device Media Browser Sheet
@@ -1404,6 +1476,95 @@ fun HomeScreen(
         )
     }
 
+    // Settings Security PIN / Recovery Phrase Verification Gate Dialog
+    if (showSettingsPinGateDialog && !isDecoyMode) {
+        var enteredPin by remember { mutableStateOf("") }
+        var recoveryMode by remember { mutableStateOf(false) }
+        var recoveryInput by remember { mutableStateOf("") }
+        var gateError by remember { mutableStateOf("") }
+
+        AlertDialog(
+            onDismissRequest = { showSettingsPinGateDialog = false },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Lock, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        if (recoveryMode) "Verify Recovery Phrase" else "Unlock Vault Settings",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            text = {
+                Column {
+                    if (recoveryMode) {
+                        Text(
+                            "Enter your Vault Recovery Phrase to open Control Center & Settings:",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = recoveryInput,
+                            onValueChange = { recoveryInput = it },
+                            label = { Text("Recovery Phrase") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        Text(
+                            "Re-enter your Master Vault PIN to access Control Center & Settings:",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = enteredPin,
+                            onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) enteredPin = it },
+                            label = { Text("Master Vault PIN") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_gate_pin_input")
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        TextButton(onClick = { recoveryMode = true; gateError = "" }) {
+                            Text("Verify with Recovery Phrase Instead", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    if (gateError.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(gateError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val verified = if (recoveryMode) {
+                            onVerifyRecoveryPhrase(recoveryInput.trim())
+                        } else {
+                            onVerifyMasterPin(enteredPin)
+                        }
+                        if (verified) {
+                            showSettingsPinGateDialog = false
+                            onOpenSettings()
+                        } else {
+                            gateError = if (recoveryMode) "Incorrect Recovery Phrase" else "Incorrect Master PIN"
+                        }
+                    },
+                    modifier = Modifier.testTag("settings_gate_confirm_button")
+                ) {
+                    Text("Unlock Settings")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSettingsPinGateDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // Importing Progress Modal Dialog
     if (isImporting) {
         AlertDialog(
@@ -1677,6 +1838,136 @@ fun FolderCard(
                     text = if (folder.isLocked) "PIN Required to View" else "$itemCount encrypted items",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun VaultExistingMediaPickerSheet(
+    candidateItems: List<VaultItem>,
+    targetFolderName: String,
+    vaultBlobsDir: File,
+    masterKey: SecretKey,
+    onDismiss: () -> Unit,
+    onConfirmMove: (List<VaultItem>) -> Unit
+) {
+    val selectedIds = remember { mutableStateListOf<Long>() }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(600.dp)
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Add from Vault to '$targetFolderName'",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Select encrypted photos & videos already in your Vault",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (candidateItems.isNotEmpty()) {
+                    TextButton(
+                        onClick = {
+                            if (selectedIds.size == candidateItems.size) {
+                                selectedIds.clear()
+                            } else {
+                                selectedIds.clear()
+                                selectedIds.addAll(candidateItems.map { it.id })
+                            }
+                        }
+                    ) {
+                        Text(if (selectedIds.size == candidateItems.size) "Deselect All" else "Select All")
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            if (candidateItems.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "No other media items available in Vault outside '$targetFolderName'.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(3),
+                    modifier = Modifier.weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(candidateItems, key = { it.id }) { item ->
+                        val isSelected = item.id in selectedIds
+                        val blobFile = remember(item.encryptedRelativePath) {
+                            File(vaultBlobsDir, item.encryptedRelativePath)
+                        }
+                        MediaThumbnailCard(
+                            item = item,
+                            blobFile = blobFile,
+                            masterKey = masterKey,
+                            showFileName = true,
+                            isSelectionMode = true,
+                            isSelected = isSelected,
+                            onClick = {
+                                if (isSelected) selectedIds.remove(item.id)
+                                else selectedIds.add(item.id)
+                            },
+                            onLongClick = {
+                                if (isSelected) selectedIds.remove(item.id)
+                                else selectedIds.add(item.id)
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Button(
+                onClick = {
+                    val chosen = candidateItems.filter { it.id in selectedIds }
+                    if (chosen.isNotEmpty()) {
+                        onConfirmMove(chosen)
+                    }
+                },
+                enabled = selectedIds.isNotEmpty(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+                    .height(50.dp)
+                    .testTag("confirm_move_from_vault_button")
+            ) {
+                Icon(Icons.Default.DriveFileMove, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    if (selectedIds.isEmpty()) "Select Vault Media to Move"
+                    else "Move ${selectedIds.size} Item(s) to '$targetFolderName'",
+                    fontWeight = FontWeight.Bold
                 )
             }
         }

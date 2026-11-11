@@ -3,13 +3,19 @@ package com.example.ui.viewer
 import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +23,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -24,12 +31,14 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RotateRight
@@ -54,10 +63,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
@@ -73,13 +86,18 @@ import java.io.File
 import javax.crypto.SecretKey
 
 /**
- * Architectural Photo Viewer Upgrade:
- * 1. Wraps `displayedItems` inside a `HorizontalPager` for smooth left/right photo swiping.
- * 2. Decrypts photos asynchronously on `Dispatchers.IO` via `ThumbnailCacheManager.decodeFullPhotoAsync`
- *    with a loading spinner, preventing Main UI thread freezes and OOM crashes.
- * 3. Implements full pinch-to-zoom WITH bounded 2D pan (`offsetX`, `offsetY`) + double-tap 1x / 2.5x zoom.
- * 4. Includes a top-bar 3-second auto-advancing Slideshow Play/Pause toggle and a permanent delete
- *    confirmation dialog.
+ * Architectural Unified Media Viewer (Photos & Videos):
+ * 1. Wraps all `displayedItems` (both photos and videos) inside a `HorizontalPager` so the user
+ *    can swipe left/right seamlessly across their entire gallery or folder.
+ * 2. Video pages display their decrypted preview frame, duration badge, and a glowing central
+ *    Play button (`viewer_play_video_button`) that launches `VideoPlayerScreen`.
+ * 3. Fixes multi-touch Pinch-to-Zoom (1x to 5x) and bounded 2D Pan (`offsetX`, `offsetY`) from 1x:
+ *    Uses an always-attached `awaitEachGesture` loop that inspects active pointer count:
+ *    - When 2+ fingers are down (`pointerCount >= 2`) OR the image is already zoomed (`scale > 1.05f`),
+ *      zoom and bounded pan are applied and pointer changes are consumed.
+ *    - When only 1 finger is down at `1f` scale, events are NOT consumed so `HorizontalPager`
+ *      swipes left/right without friction.
+ * 4. Smooth animated 90-degree rotation (`animateFloatAsState`) + double-tap 1x / 2.8x zoom.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -89,6 +107,7 @@ fun PhotoViewerScreen(
     vaultBlobsDir: File,
     masterKey: SecretKey,
     onBack: () -> Unit,
+    onPlayVideo: (VaultItem) -> Unit = {},
     onToggleFavorite: (VaultItem) -> Unit,
     onUnhide: (VaultItem) -> Unit,
     onDelete: (VaultItem) -> Unit
@@ -115,7 +134,7 @@ fun PhotoViewerScreen(
     var isSlideshowActive by remember { mutableStateOf(false) }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
 
-    // Track per-item zoom scale so HorizontalPager only scrolls between pages when current page scale == 1f
+    // Track per-item zoom scale so HorizontalPager only scrolls between pages when current page scale <= 1.05f
     var activePageScale by remember { mutableFloatStateOf(1f) }
     val rotationMap = remember { mutableStateMapOf<Long, Float>() }
     val favoriteMap = remember(photoItems) {
@@ -150,10 +169,11 @@ fun PhotoViewerScreen(
         Box(modifier = Modifier.fillMaxSize()) {
             HorizontalPager(
                 state = pagerState,
-                userScrollEnabled = activePageScale <= 1.02f,
+                userScrollEnabled = activePageScale <= 1.05f,
                 modifier = Modifier.fillMaxSize()
             ) { pageIndex ->
                 val pageItem = photoItems.getOrNull(pageIndex) ?: return@HorizontalPager
+                val isVideo = pageItem.mimeType.startsWith("video")
                 val blobFile = remember(pageItem.encryptedRelativePath) {
                     File(vaultBlobsDir, pageItem.encryptedRelativePath)
                 }
@@ -161,16 +181,21 @@ fun PhotoViewerScreen(
                     fromHex(pageItem.baseIvHex)
                 }
 
-                var bitmap by remember(pageItem.id) { mutableStateOf<Bitmap?>(null) }
+                var fullBitmap by remember(pageItem.id) { mutableStateOf<Bitmap?>(null) }
+                var videoThumb by remember(pageItem.id) { mutableStateOf<ImageBitmap?>(null) }
                 var isLoading by remember(pageItem.id) { mutableStateOf(true) }
 
                 LaunchedEffect(pageItem.id) {
                     isLoading = true
-                    bitmap = ThumbnailCacheManager.decodeFullPhotoAsync(
-                        blobFile = blobFile,
-                        masterKey = masterKey,
-                        baseIv = baseIv
-                    )
+                    if (isVideo) {
+                        videoThumb = ThumbnailCacheManager.loadThumbnail(pageItem, blobFile, masterKey)
+                    } else {
+                        fullBitmap = ThumbnailCacheManager.decodeFullPhotoAsync(
+                            blobFile = blobFile,
+                            masterKey = masterKey,
+                            baseIv = baseIv
+                        )
+                    }
                     isLoading = false
                 }
 
@@ -179,7 +204,11 @@ fun PhotoViewerScreen(
                 var offsetY by remember(pageItem.id, pagerState.currentPage) { mutableFloatStateOf(0f) }
                 var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
-                val pageRotation = rotationMap[pageItem.id] ?: 0f
+                val targetRotation = rotationMap[pageItem.id] ?: 0f
+                val animatedRotation by animateFloatAsState(
+                    targetValue = targetRotation,
+                    label = "viewer_rotation"
+                )
 
                 Box(
                     modifier = Modifier
@@ -196,7 +225,7 @@ fun PhotoViewerScreen(
                                         offsetX = 0f
                                         offsetY = 0f
                                     } else {
-                                        val targetScale = 2.5f
+                                        val targetScale = 2.8f
                                         val centerX = containerSize.width / 2f
                                         val centerY = containerSize.height / 2f
                                         val maxX = (containerSize.width * (targetScale - 1f)) / 2f
@@ -211,31 +240,46 @@ fun PhotoViewerScreen(
                                 }
                             )
                         }
-                        .then(
-                            if (scale > 1.01f) {
-                                Modifier.pointerInput(pageItem.id, scale) {
-                                    detectTransformGestures { _, pan, zoom, _ ->
-                                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                        .pointerInput(pageItem.id) {
+                            // Always-attached multi-touch pinch-to-zoom & pan handler:
+                            // Processes zoom immediately on 2-finger pinch from 1x scale, and pans when zoomed in,
+                            // while allowing 1-finger horizontal drags at 1x scale to pass to HorizontalPager.
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pressedCount = event.changes.count { it.pressed }
+                                    if (pressedCount >= 2 || scale > 1.05f) {
+                                        val zoomChange = event.calculateZoom()
+                                        val panChange = event.calculatePan()
+
+                                        val newScale = (scale * zoomChange).coerceIn(1f, 5f)
                                         val maxX = (containerSize.width * (newScale - 1f)) / 2f
                                         val maxY = (containerSize.height * (newScale - 1f)) / 2f
-                                        if (newScale <= 1.01f) {
+
+                                        if (newScale <= 1.02f && pressedCount < 2) {
                                             scale = 1f
                                             offsetX = 0f
                                             offsetY = 0f
                                         } else {
                                             scale = newScale
-                                            offsetX = (offsetX + pan.x).coerceIn(-maxX, maxX)
-                                            offsetY = (offsetY + pan.y).coerceIn(-maxY, maxY)
+                                            offsetX = (offsetX + panChange.x).coerceIn(-maxX, maxX)
+                                            offsetY = (offsetY + panChange.y).coerceIn(-maxY, maxY)
                                         }
+
                                         if (pageIndex == pagerState.currentPage) {
                                             activePageScale = scale
                                         }
+
+                                        event.changes.forEach { change ->
+                                            if (change.positionChanged()) {
+                                                change.consume()
+                                            }
+                                        }
                                     }
-                                }
-                            } else {
-                                Modifier
+                                } while (event.changes.any { it.pressed })
                             }
-                        ),
+                        },
                     contentAlignment = Alignment.Center
                 ) {
                     when {
@@ -245,9 +289,87 @@ fun PhotoViewerScreen(
                                 modifier = Modifier.size(44.dp)
                             )
                         }
-                        bitmap != null -> {
+                        isVideo -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (videoThumb != null) {
+                                    Image(
+                                        bitmap = videoThumb!!,
+                                        contentDescription = pageItem.fileName,
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .graphicsLayer(
+                                                scaleX = scale,
+                                                scaleY = scale,
+                                                translationX = offsetX,
+                                                translationY = offsetY,
+                                                rotationZ = animatedRotation
+                                            )
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Movie,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                        modifier = Modifier.size(96.dp)
+                                    )
+                                }
+
+                                // Central Play Video Button Overlay
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(80.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                Brush.linearGradient(
+                                                    listOf(
+                                                        MaterialTheme.colorScheme.primary,
+                                                        MaterialTheme.colorScheme.secondary
+                                                    )
+                                                )
+                                            )
+                                            .border(2.dp, Color.White.copy(alpha = 0.4f), CircleShape)
+                                            .clickable { onPlayVideo(pageItem) }
+                                            .testTag("viewer_play_video_button"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.PlayArrow,
+                                            contentDescription = "Play Encrypted Video",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(44.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color.Black.copy(alpha = 0.72f))
+                                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = if (pageItem.durationMs > 0) {
+                                                "Tap to Play Video (${formatDuration(pageItem.durationMs)})"
+                                            } else {
+                                                "Tap to Play Encrypted Video"
+                                            },
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        fullBitmap != null -> {
                             Image(
-                                bitmap = bitmap!!.asImageBitmap(),
+                                bitmap = fullBitmap!!.asImageBitmap(),
                                 contentDescription = pageItem.fileName,
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier
@@ -257,13 +379,13 @@ fun PhotoViewerScreen(
                                         scaleY = scale,
                                         translationX = offsetX,
                                         translationY = offsetY,
-                                        rotationZ = pageRotation
+                                        rotationZ = animatedRotation
                                     )
                             )
                         }
                         else -> {
                             Text(
-                                text = "Unable to decode encrypted photo",
+                                text = "Unable to decode encrypted media",
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
@@ -281,7 +403,11 @@ fun PhotoViewerScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.68f))
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Black.copy(alpha = 0.8f), Color.Transparent)
+                            )
+                        )
                         .statusBarsPadding()
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -306,7 +432,8 @@ fun PhotoViewerScreen(
                         )
                         Text(
                             text = "${pagerState.currentPage + 1} of ${photoItems.size}" +
-                                if (isSlideshowActive) " • Slideshow Active" else "",
+                                (if (currentItem.mimeType.startsWith("video")) " • Video" else " • Photo") +
+                                (if (isSlideshowActive) " • Slideshow Active" else ""),
                             color = Color.White.copy(alpha = 0.72f),
                             fontSize = 11.sp
                         )
@@ -329,7 +456,7 @@ fun PhotoViewerScreen(
                     // Rotate 90° Button
                     IconButton(
                         onClick = {
-                            rotationMap[currentItem.id] = (currentRotation + 90f) % 360f
+                            rotationMap[currentItem.id] = currentRotation + 90f
                         },
                         modifier = Modifier.testTag("rotate_photo")
                     ) {
@@ -348,7 +475,11 @@ fun PhotoViewerScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.75f))
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))
+                            )
+                        )
                         .navigationBarsPadding()
                         .padding(horizontal = 24.dp, vertical = 14.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
@@ -390,12 +521,12 @@ fun PhotoViewerScreen(
         }
     }
 
-    // Confirmation Dialog before permanent photo deletion
+    // Confirmation Dialog before permanent deletion
     if (showDeleteConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirmDialog = false },
             shape = RoundedCornerShape(16.dp),
-            title = { Text("Delete Photo Permanently?", fontWeight = FontWeight.Bold) },
+            title = { Text("Delete Media Permanently?", fontWeight = FontWeight.Bold) },
             text = {
                 Text(
                     "Are you sure you want to permanently destroy '${currentItem.fileName}' from your encrypted vault? This action cannot be undone."
@@ -423,6 +554,13 @@ fun PhotoViewerScreen(
     }
 }
 
+private fun formatDuration(ms: Long): String {
+    val totalSec = (ms / 1000).coerceAtLeast(0)
+    val m = totalSec / 60
+    val s = totalSec % 60
+    return String.format("%02d:%02d", m, s)
+}
+
 private fun fromHex(hex: String): ByteArray {
     val len = hex.length
     val data = ByteArray(len / 2)
@@ -433,3 +571,4 @@ private fun fromHex(hex: String): ByteArray {
     }
     return data
 }
+

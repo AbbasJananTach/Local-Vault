@@ -58,7 +58,8 @@ fun AuthScreen(
     onPinSubmit: (String) -> Unit,
     onSetupCompleted: (pin: String, recoveryPhrase: String) -> Unit,
     onRecoveryPhraseSubmit: (String) -> Boolean,
-    onResetPinConfirmed: (newPin: String) -> Unit
+    onResetPinConfirmed: (newPin: String) -> Unit,
+    onRestoreBackupClick: (() -> Unit)? = null
 ) {
     var pinText by remember { mutableStateOf("") }
     var confirmPinText by remember { mutableStateOf("") }
@@ -208,7 +209,7 @@ fun AuthScreen(
                         )
                         Spacer(modifier = Modifier.height(24.dp))
                         PinDotsDisplay(pinLength = pinText.length)
-                        Spacer(modifier = Modifier.height(32.dp))
+                        Spacer(modifier = Modifier.height(28.dp))
                         NumericKeypad(
                             onDigitClick = { digit ->
                                 if (pinText.length < 10) pinText += digit
@@ -224,6 +225,15 @@ fun AuthScreen(
                                 }
                             }
                         )
+                        if (onRestoreBackupClick != null) {
+                            Spacer(modifier = Modifier.height(18.dp))
+                            TextButton(
+                                onClick = onRestoreBackupClick,
+                                modifier = Modifier.testTag("setup_restore_backup_button")
+                            ) {
+                                Text("Migrating phones? Restore Encrypted Backup (.lvb)")
+                            }
+                        }
                     }
                     2 -> {
                         Text(

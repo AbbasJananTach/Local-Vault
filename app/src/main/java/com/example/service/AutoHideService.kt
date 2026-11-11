@@ -34,6 +34,7 @@ class AutoHideService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val observers = mutableListOf<FileObserver>()
+    private var periodicSweepJob: kotlinx.coroutines.Job? = null
     private var activeMasterKey: SecretKey? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -124,6 +125,22 @@ class AutoHideService : Service() {
                 observers.add(observer)
             }
         }
+
+        // Architectural Fix: Android 11-15 Scoped Storage & FUSE mounts sometimes suppress
+        // inotify FileObserver events when camera/social apps move temporary files.
+        // Run a lightweight periodic 10-second directory sweep alongside FileObserver.
+        val pathSet = paths.toSet()
+        periodicSweepJob = serviceScope.launch {
+            while (true) {
+                delay(10_000L)
+                val key = activeMasterKey ?: continue
+                vaultStorage.sweepWatchedFoldersNow(
+                    watchedPaths = pathSet,
+                    masterKey = key,
+                    isDecoy = isDecoy
+                )
+            }
+        }
     }
 
     private fun sweepFolder(folder: File, vaultStorage: VaultStorage, targetFolderId: Long?, isDecoy: Boolean) {
@@ -171,6 +188,8 @@ class AutoHideService : Service() {
     }
 
     private fun stopObservers() {
+        periodicSweepJob?.cancel()
+        periodicSweepJob = null
         observers.forEach { it.stopWatching() }
         observers.clear()
     }

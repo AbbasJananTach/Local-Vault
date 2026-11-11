@@ -137,13 +137,18 @@ class MainActivity : ComponentActivity() {
                 val result = vaultStorage.restoreEncryptedBackup(sourceUri, headerManager.headerFile)
                 isImporting.value = false
                 result.onSuccess { count ->
+                    // Architectural Fix: Restoring an .lvb backup replaces vault.header on disk
+                    // with the backup's wrapped Master Vault Key (MVK). Clear any stale in-RAM
+                    // masterKey and return to Screen.Auth so the user unlocks with the backup's PIN.
                     ThumbnailCacheManager.clearCache()
-                    masterKey?.let { key ->
-                        vaultStorage.syncEncryptedCatalog(key)
-                    }
+                    masterKey = null
+                    isDecoyVault = false
+                    database = VaultDatabase.getInstance(this@MainActivity)
+                    dbRefreshTick++
+                    currentScreen.value = Screen.Auth
                     Toast.makeText(
                         this@MainActivity,
-                        "Restored $count encrypted items to Vault",
+                        "Restored $count items! Enter your backup's Master PIN to unlock.",
                         Toast.LENGTH_LONG
                     ).show()
                 }.onFailure { err ->
@@ -243,6 +248,13 @@ class MainActivity : ComponentActivity() {
                                             if (key != null) {
                                                 scope.launch(Dispatchers.IO) {
                                                     vaultStorage.reconcileAndRecoverCatalog(key)
+                                                    if (isAutoHideEnabled && watchedFolders.isNotEmpty()) {
+                                                        vaultStorage.sweepWatchedFoldersNow(
+                                                            watchedPaths = watchedFolders,
+                                                            masterKey = key,
+                                                            isDecoy = false
+                                                        )
+                                                    }
                                                 }
                                             }
                                             if (isAutoHideEnabled) {
@@ -300,6 +312,10 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onResetPinConfirmed = { newPin ->
                                     masterKey?.let { headerManager.resetPinWithMasterKey(it, newPin) }
+                                },
+                                onRestoreBackupClick = {
+                                    isLaunchingExternalPicker = true
+                                    restoreBackupLauncher.launch(arrayOf("*/*"))
                                 }
                             )
                         }
@@ -386,17 +402,21 @@ class MainActivity : ComponentActivity() {
                                     onVerifyRecoveryPhrase = { phrase ->
                                         headerManager.authenticateRecoveryPhrase(phrase).first
                                     },
+                                    onVerifyMasterPin = { inputPin ->
+                                        headerManager.verifyRealPinOnly(inputPin)
+                                    },
                                     onItemClick = { item, displayedItems ->
+                                        // Pass ALL displayedItems (both photos and videos) so the user can swipe
+                                        // left/right across their entire gallery/folder seamlessly, or play videos directly.
                                         if (item.mimeType.startsWith("video")) {
                                             currentScreen.value = Screen.VideoPlayer(item)
                                         } else {
-                                            val photoIds = displayedItems
-                                                .filter { !it.mimeType.startsWith("video") }
+                                            val mediaIds = displayedItems
                                                 .map { it.id }
                                                 .ifEmpty { listOf(item.id) }
                                             currentScreen.value = Screen.PhotoViewer(
                                                 initialItemId = item.id,
-                                                photoIds = photoIds
+                                                photoIds = mediaIds
                                             )
                                         }
                                     },
@@ -462,10 +482,13 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
                                     },
-                                    onOpenSettings = { currentScreen.value = Screen.Settings },
+                                    onOpenSettings = {
+                                        if (!isDecoyVault) {
+                                            currentScreen.value = Screen.Settings
+                                        }
+                                    },
                                     onColumnCountChanged = { cols -> vaultPrefs.setDefaultGridColumns(cols) },
-                                    usedStorageBytes = items.sumOf { it.fileSize },
-                                    totalStorageBytes = Environment.getExternalStorageDirectory().freeSpace
+                                    usedStorageBytes = items.sumOf { it.fileSize }
                                 )
                             }
                         }
@@ -496,6 +519,9 @@ class MainActivity : ComponentActivity() {
                                     vaultBlobsDir = vaultStorage.vaultBlobsDir,
                                     masterKey = key,
                                     onBack = { currentScreen.value = Screen.Home },
+                                    onPlayVideo = { videoItem ->
+                                        currentScreen.value = Screen.VideoPlayer(videoItem)
+                                    },
                                     onToggleFavorite = { item ->
                                         scope.launch(Dispatchers.IO) {
                                             dao.updateItem(item)
@@ -538,104 +564,124 @@ class MainActivity : ComponentActivity() {
                         }
 
                         is Screen.Settings -> {
-                            SettingsScreen(
-                                onBack = { currentScreen.value = Screen.Home },
-                                onChangeMasterPin = { oldPin, newPin ->
-                                    val key = masterKey
-                                    if (key != null && headerManager.verifyRealPinOnly(oldPin)) {
-                                        val ok = headerManager.resetPinWithMasterKey(key, newPin)
+                            if (isDecoyVault) {
+                                currentScreen.value = Screen.Home
+                            } else {
+                                SettingsScreen(
+                                    onBack = { currentScreen.value = Screen.Home },
+                                    vaultStorage = vaultStorage,
+                                    onChangeMasterPin = { oldPin, newPin ->
+                                        val key = masterKey
+                                        if (key != null && headerManager.verifyRealPinOnly(oldPin)) {
+                                            val ok = headerManager.resetPinWithMasterKey(key, newPin)
+                                            if (ok) {
+                                                Toast.makeText(this, "Master PIN updated", Toast.LENGTH_SHORT).show()
+                                            }
+                                            ok
+                                        } else false
+                                    },
+                                    onUpdateRecoveryPhrase = { newPhrase ->
+                                        val key = masterKey
+                                        if (key != null) {
+                                            val ok = headerManager.updateRecoveryPhrase(key, newPhrase)
+                                            if (ok) {
+                                                hasRecoveryState = true
+                                                Toast.makeText(this, "Recovery Phrase updated", Toast.LENGTH_SHORT).show()
+                                            }
+                                            ok
+                                        } else false
+                                    },
+                                    hasRecoveryPhrase = hasRecoveryState,
+                                    onSetupFakePin = { fakePin ->
+                                        val ok = headerManager.setupDecoyPin(fakePin)
                                         if (ok) {
-                                            Toast.makeText(this, "Master PIN updated", Toast.LENGTH_SHORT).show()
+                                            hasDecoyState = true
+                                            Toast.makeText(this, "Decoy PIN Enabled", Toast.LENGTH_SHORT).show()
                                         }
                                         ok
-                                    } else false
-                                },
-                                onUpdateRecoveryPhrase = { newPhrase ->
-                                    val key = masterKey
-                                    if (key != null) {
-                                        val ok = headerManager.updateRecoveryPhrase(key, newPhrase)
-                                        if (ok) {
-                                            hasRecoveryState = true
-                                            Toast.makeText(this, "Recovery Phrase updated", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onRemoveFakePin = {
+                                        headerManager.removeDecoyPin()
+                                        hasDecoyState = false
+                                        Toast.makeText(this, "Decoy PIN Disabled", Toast.LENGTH_SHORT).show()
+                                    },
+                                    hasDecoyPin = hasDecoyState,
+                                    bruteForceLockoutEnabled = bruteForceLockoutEnabled,
+                                    onToggleBruteForceLockout = { enabled ->
+                                        vaultPrefs.setBruteForceLockoutEnabled(enabled)
+                                    },
+                                    blockScreenshots = blockScreenshots,
+                                    onToggleBlockScreenshots = { enabled ->
+                                        vaultPrefs.setBlockScreenshots(enabled)
+                                        applyFlagSecure(enabled)
+                                    },
+                                    autoLockMode = autoLockMode,
+                                    onAutoLockModeChanged = { mode ->
+                                        vaultPrefs.setAutoLockMode(mode)
+                                    },
+                                    themeMode = themeMode,
+                                    onThemeModeChanged = { mode ->
+                                        vaultPrefs.setThemeMode(mode)
+                                    },
+                                    defaultGridColumns = defaultGridColumns,
+                                    onDefaultGridColumnsChanged = { cols ->
+                                        vaultPrefs.setDefaultGridColumns(cols)
+                                    },
+                                    showFileNamesOnGrid = showFileNamesOnGrid,
+                                    onToggleShowFileNames = { show ->
+                                        vaultPrefs.setShowFileNamesOnGrid(show)
+                                    },
+                                    isAutoHideEnabled = isAutoHideEnabled,
+                                    onToggleAutoHide = { enabled ->
+                                        vaultPrefs.setAutoHideEnabled(enabled)
+                                        syncAutoHideService(enabled, watchedFolders)
+                                    },
+                                    watchedFolders = watchedFolders,
+                                    onToggleWatchedFolder = { path ->
+                                        vaultPrefs.toggleWatchedFolder(path)
+                                        if (isAutoHideEnabled) {
+                                            syncAutoHideService(true, vaultPrefs.watchedFolders.value)
                                         }
-                                        ok
-                                    } else false
-                                },
-                                hasRecoveryPhrase = hasRecoveryState,
-                                onSetupFakePin = { fakePin ->
-                                    val ok = headerManager.setupDecoyPin(fakePin)
-                                    if (ok) {
-                                        hasDecoyState = true
-                                        Toast.makeText(this, "Decoy PIN Enabled", Toast.LENGTH_SHORT).show()
-                                    }
-                                    ok
-                                },
-                                onRemoveFakePin = {
-                                    headerManager.removeDecoyPin()
-                                    hasDecoyState = false
-                                    Toast.makeText(this, "Decoy PIN Disabled", Toast.LENGTH_SHORT).show()
-                                },
-                                hasDecoyPin = hasDecoyState,
-                                bruteForceLockoutEnabled = bruteForceLockoutEnabled,
-                                onToggleBruteForceLockout = { enabled ->
-                                    vaultPrefs.setBruteForceLockoutEnabled(enabled)
-                                },
-                                blockScreenshots = blockScreenshots,
-                                onToggleBlockScreenshots = { enabled ->
-                                    vaultPrefs.setBlockScreenshots(enabled)
-                                    applyFlagSecure(enabled)
-                                },
-                                autoLockMode = autoLockMode,
-                                onAutoLockModeChanged = { mode ->
-                                    vaultPrefs.setAutoLockMode(mode)
-                                },
-                                themeMode = themeMode,
-                                onThemeModeChanged = { mode ->
-                                    vaultPrefs.setThemeMode(mode)
-                                },
-                                defaultGridColumns = defaultGridColumns,
-                                onDefaultGridColumnsChanged = { cols ->
-                                    vaultPrefs.setDefaultGridColumns(cols)
-                                },
-                                showFileNamesOnGrid = showFileNamesOnGrid,
-                                onToggleShowFileNames = { show ->
-                                    vaultPrefs.setShowFileNamesOnGrid(show)
-                                },
-                                isAutoHideEnabled = isAutoHideEnabled,
-                                onToggleAutoHide = { enabled ->
-                                    vaultPrefs.setAutoHideEnabled(enabled)
-                                    syncAutoHideService(enabled, watchedFolders)
-                                },
-                                watchedFolders = watchedFolders,
-                                onToggleWatchedFolder = { path ->
-                                    vaultPrefs.toggleWatchedFolder(path)
-                                    if (isAutoHideEnabled) {
-                                        syncAutoHideService(true, vaultPrefs.watchedFolders.value)
-                                    }
-                                },
-                                onAddCustomWatchedFolder = { path ->
-                                    vaultPrefs.addCustomWatchedFolder(path)
-                                    if (isAutoHideEnabled) {
-                                        syncAutoHideService(true, vaultPrefs.watchedFolders.value)
-                                    }
-                                },
-                                onCreateBackup = {
-                                    val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-                                    isLaunchingExternalPicker = true
-                                    createBackupLauncher.launch("VaultBackup_$dateStr.lvb")
-                                },
-                                onRestoreBackup = {
-                                    isLaunchingExternalPicker = true
-                                    restoreBackupLauncher.launch(arrayOf("*/*"))
-                                },
-                                totalItemsCount = items.size,
-                                usedVaultBytes = items.sumOf { it.fileSize },
-                                freeDeviceBytes = Environment.getExternalStorageDirectory().freeSpace,
-                                onClearThumbnailCache = {
-                                    ThumbnailCacheManager.clearCache()
-                                    Toast.makeText(this, "Thumbnail RAM cache cleared", Toast.LENGTH_SHORT).show()
-                                }
-                            )
+                                    },
+                                    onAddCustomWatchedFolder = { path ->
+                                        vaultPrefs.addCustomWatchedFolder(path)
+                                        if (isAutoHideEnabled) {
+                                            syncAutoHideService(true, vaultPrefs.watchedFolders.value)
+                                        }
+                                    },
+                                    onSweepWatchedFoldersNow = {
+                                        val key = masterKey ?: return@SettingsScreen
+                                        scope.launch(Dispatchers.IO) {
+                                            val count = vaultStorage.sweepWatchedFoldersNow(
+                                                watchedPaths = vaultPrefs.watchedFolders.value,
+                                                masterKey = key,
+                                                isDecoy = isDecoyVault
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    if (count > 0) "Swept & encrypted $count file(s) from watched folders"
+                                                    else "Watched folders are clean (0 new files found)",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                        }
+                                    },
+                                    onCreateBackup = {
+                                        val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+                                        isLaunchingExternalPicker = true
+                                        createBackupLauncher.launch("VaultBackup_$dateStr.lvb")
+                                    },
+                                    onRestoreBackup = {
+                                        isLaunchingExternalPicker = true
+                                        restoreBackupLauncher.launch(arrayOf("*/*"))
+                                    },
+                                    totalPhotosCount = items.count { !it.mimeType.startsWith("video") },
+                                    totalVideosCount = items.count { it.mimeType.startsWith("video") },
+                                    totalFoldersCount = folders.size,
+                                    usedVaultBytes = items.sumOf { it.fileSize }
+                                )
+                            }
                         }
                     }
                 }
