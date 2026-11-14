@@ -173,7 +173,27 @@ private object DeviceBrowserThumbnailLoader {
             }
             return null
         } else {
-            // Sampled BitmapFactory decode for device photos
+            // Stage 2: ImageDecoder on Android 9+ (natively supports HEIC, HEIF, WEBP, BMP, GIF, PNG, JPG)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                try {
+                    val source = android.graphics.ImageDecoder.createSource(file)
+                    val decoded = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                        decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                        val w = info.size.width
+                        val h = info.size.height
+                        if (w > 0 && h > 0) {
+                            var sample = 1
+                            while (w / (sample * 2) >= 320 && h / (sample * 2) >= 320) {
+                                sample *= 2
+                            }
+                            decoder.setTargetSampleSize(sample)
+                        }
+                    }
+                    return decoded
+                } catch (_: Throwable) {
+                }
+            }
+            // Stage 3: Sampled BitmapFactory decode fallback
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null

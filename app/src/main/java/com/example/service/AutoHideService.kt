@@ -183,8 +183,7 @@ class AutoHideService : Service() {
     }
 
     private fun isMediaFile(name: String): Boolean {
-        val ext = name.substringAfterLast('.', "").lowercase()
-        return ext in setOf("jpg", "jpeg", "png", "webp", "gif", "mp4", "mkv", "mov", "avi", "3gp", "webm")
+        return VaultStorage.isSupportedMediaFileName(name)
     }
 
     private fun stopObservers() {

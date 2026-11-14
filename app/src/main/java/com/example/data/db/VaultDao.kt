@@ -16,6 +16,9 @@ interface VaultDao {
     @Query("SELECT * FROM vault_items ORDER BY dateAdded DESC")
     suspend fun getAllItemsSync(): List<VaultItem>
 
+    @Query("SELECT * FROM vault_items WHERE isDecoy = :isDecoy ORDER BY dateAdded DESC")
+    suspend fun getAllItemsByDecoySync(isDecoy: Boolean): List<VaultItem>
+
     @Query("SELECT * FROM vault_items WHERE isFavorite = 1 AND isDecoy = :isDecoy ORDER BY dateAdded DESC")
     fun getFavorites(isDecoy: Boolean): Flow<List<VaultItem>>
 
@@ -27,6 +30,9 @@ interface VaultDao {
 
     @Query("SELECT * FROM vault_items WHERE id = :id LIMIT 1")
     suspend fun getItemById(id: Long): VaultItem?
+
+    @Query("SELECT * FROM vault_items WHERE encryptedRelativePath = :encryptedRelativePath LIMIT 1")
+    suspend fun getItemByEncryptedPath(encryptedRelativePath: String): VaultItem?
 
     @Query("SELECT * FROM vault_items WHERE fileName LIKE '%' || :query || '%' AND isDecoy = :isDecoy ORDER BY dateAdded DESC")
     fun searchItems(query: String, isDecoy: Boolean): Flow<List<VaultItem>>
@@ -42,6 +48,9 @@ interface VaultDao {
 
     @Query("DELETE FROM vault_items WHERE id IN (:ids)")
     suspend fun deleteItemsByIds(ids: List<Long>)
+
+    @Query("DELETE FROM vault_items WHERE encryptedRelativePath = :encryptedRelativePath")
+    suspend fun deleteByEncryptedPath(encryptedRelativePath: String)
 
     @Query("UPDATE vault_items SET folderId = :targetFolderId WHERE id IN (:ids)")
     suspend fun moveItemsToFolder(ids: List<Long>, targetFolderId: Long?)

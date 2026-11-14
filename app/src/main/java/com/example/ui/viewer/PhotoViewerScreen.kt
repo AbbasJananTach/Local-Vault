@@ -1,6 +1,8 @@
 package com.example.ui.viewer
 
+import android.app.Activity
 import android.graphics.Bitmap
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
@@ -38,11 +40,11 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RotateRight
-import androidx.compose.material.icons.filled.Unpublished
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -54,6 +56,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -73,6 +76,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,24 +85,26 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.ThumbnailCacheManager
+import com.example.data.db.FolderItem
 import com.example.data.db.VaultItem
+import com.example.ui.components.CustomPinKeypadDialog
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import javax.crypto.SecretKey
 
 /**
- * Architectural Unified Media Viewer (Photos & Videos):
- * 1. Wraps all `displayedItems` (both photos and videos) inside a `HorizontalPager` so the user
- *    can swipe left/right seamlessly across their entire gallery or folder.
- * 2. Video pages display their decrypted preview frame, duration badge, and a glowing central
- *    Play button (`viewer_play_video_button`) that launches `VideoPlayerScreen`.
- * 3. Fixes multi-touch Pinch-to-Zoom (1x to 5x) and bounded 2D Pan (`offsetX`, `offsetY`) from 1x:
- *    Uses an always-attached `awaitEachGesture` loop that inspects active pointer count:
- *    - When 2+ fingers are down (`pointerCount >= 2`) OR the image is already zoomed (`scale > 1.05f`),
- *      zoom and bounded pan are applied and pointer changes are consumed.
- *    - When only 1 finger is down at `1f` scale, events are NOT consumed so `HorizontalPager`
- *      swipes left/right without friction.
- * 4. Smooth animated 90-degree rotation (`animateFloatAsState`) + double-tap 1x / 2.8x zoom.
+ * Point 28: Photo Viewer Refinements:
+ * 1. Instant Cached Thumbnail Display: Immediately renders the cached decrypted thumbnail from
+ *    `ThumbnailCacheManager` while the full-resolution encrypted image stream decodes asynchronously
+ *    in the background—eliminating any black screen delay.
+ * 2. Slideshow Mode Controls & Screen Wake Lock: Auto-hides top and bottom overlay bars when
+ *    Slideshow is active and keeps `FLAG_KEEP_SCREEN_ON` + `LocalView.current.keepScreenOn = true`
+ *    active so the screen never times out during a slideshow.
+ * 3. Safe Spacing & Security on Unhide and Delete Buttons: Separates `Unhide` (far left),
+ *    `Favorite` (center), and `Delete` (far right) across the bottom bar with generous spacing
+ *    so the user never taps Delete by mistake when trying to tap Unhide, and gates both behind
+ *    Confirmation + Contextual PIN Keypad verification.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -106,6 +113,8 @@ fun PhotoViewerScreen(
     initialItemId: Long,
     vaultBlobsDir: File,
     masterKey: SecretKey,
+    folders: List<FolderItem> = emptyList(),
+    onVerifyContextualPin: (Long?, String) -> Boolean = { _, _ -> true },
     onBack: () -> Unit,
     onPlayVideo: (VaultItem) -> Unit = {},
     onToggleFavorite: (VaultItem) -> Unit,
@@ -113,6 +122,9 @@ fun PhotoViewerScreen(
     onDelete: (VaultItem) -> Unit
 ) {
     BackHandler { onBack() }
+    val context = LocalContext.current
+    val currentView = LocalView.current
+    val activity = context as? Activity
 
     if (photoItems.isEmpty()) {
         LaunchedEffect(Unit) { onBack() }
@@ -133,6 +145,19 @@ fun PhotoViewerScreen(
     var isControlsVisible by remember { mutableStateOf(true) }
     var isSlideshowActive by remember { mutableStateOf(false) }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+    var showUnhideConfirmDialog by remember { mutableStateOf(false) }
+    var pendingPinActionTitle by remember { mutableStateOf<String?>(null) }
+    var pendingPinActionCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    // Point 28 (Step 2): Screen Wake Lock in Photo Viewer & Slideshow Mode so screen never turns off
+    DisposableEffect(currentView, isSlideshowActive) {
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        currentView.keepScreenOn = true
+        onDispose {
+            currentView.keepScreenOn = false
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     // Track per-item zoom scale so HorizontalPager only scrolls between pages when current page scale <= 1.05f
     var activePageScale by remember { mutableFloatStateOf(1f) }
@@ -148,14 +173,26 @@ fun PhotoViewerScreen(
         activePageScale = 1f
     }
 
-    // Slideshow auto-advance loop (every 3 seconds)
+    // Point 28 (Step 2): Auto-hide top and bottom overlay bars when Slideshow is active
+    // and advance every 3 seconds.
     LaunchedEffect(isSlideshowActive, photoItems.size) {
+        if (isSlideshowActive) {
+            isControlsVisible = false
+        }
         while (isSlideshowActive && photoItems.size > 1) {
             delay(3000L)
             if (isSlideshowActive && photoItems.isNotEmpty()) {
                 val nextPage = (pagerState.currentPage + 1) % photoItems.size
                 pagerState.animateScrollToPage(nextPage)
             }
+        }
+    }
+
+    // If user taps screen to reveal controls while slideshow is active, auto-hide controls again after 2.5s
+    LaunchedEffect(isControlsVisible, isSlideshowActive) {
+        if (isSlideshowActive && isControlsVisible) {
+            delay(2500L)
+            isControlsVisible = false
         }
     }
 
@@ -181,22 +218,41 @@ fun PhotoViewerScreen(
                     fromHex(pageItem.baseIvHex)
                 }
 
+                // Point 28 (Step 1): Immediately grab the cached decrypted thumbnail so there is ZERO black screen delay
+                var cachedThumb by remember(pageItem.id) {
+                    mutableStateOf<ImageBitmap?>(ThumbnailCacheManager.getCached(pageItem.id))
+                }
                 var fullBitmap by remember(pageItem.id) { mutableStateOf<Bitmap?>(null) }
-                var videoThumb by remember(pageItem.id) { mutableStateOf<ImageBitmap?>(null) }
-                var isLoading by remember(pageItem.id) { mutableStateOf(true) }
+                var isLoading by remember(pageItem.id) {
+                    mutableStateOf(cachedThumb == null)
+                }
 
                 LaunchedEffect(pageItem.id) {
-                    isLoading = true
                     if (isVideo) {
-                        videoThumb = ThumbnailCacheManager.loadThumbnail(pageItem, blobFile, masterKey)
+                        if (cachedThumb == null) {
+                            cachedThumb = ThumbnailCacheManager.loadThumbnail(pageItem, blobFile, masterKey)
+                        }
+                        isLoading = false
                     } else {
-                        fullBitmap = ThumbnailCacheManager.decodeFullPhotoAsync(
+                        if (cachedThumb == null) {
+                            launch {
+                                val loadedThumb = ThumbnailCacheManager.loadThumbnail(pageItem, blobFile, masterKey)
+                                if (loadedThumb != null && fullBitmap == null) {
+                                    cachedThumb = loadedThumb
+                                    isLoading = false
+                                }
+                            }
+                        }
+                        val decodedFull = ThumbnailCacheManager.decodeFullPhotoAsync(
                             blobFile = blobFile,
                             masterKey = masterKey,
                             baseIv = baseIv
                         )
+                        if (decodedFull != null) {
+                            fullBitmap = decodedFull
+                        }
+                        isLoading = false
                     }
-                    isLoading = false
                 }
 
                 var scale by remember(pageItem.id, pagerState.currentPage) { mutableFloatStateOf(1f) }
@@ -241,9 +297,6 @@ fun PhotoViewerScreen(
                             )
                         }
                         .pointerInput(pageItem.id) {
-                            // Always-attached multi-touch pinch-to-zoom & pan handler:
-                            // Processes zoom immediately on 2-finger pinch from 1x scale, and pans when zoomed in,
-                            // while allowing 1-finger horizontal drags at 1x scale to pass to HorizontalPager.
                             awaitEachGesture {
                                 awaitFirstDown(requireUnconsumed = false)
                                 do {
@@ -282,21 +335,19 @@ fun PhotoViewerScreen(
                         },
                     contentAlignment = Alignment.Center
                 ) {
+                    val displayImageBitmap: ImageBitmap? = remember(fullBitmap, cachedThumb) {
+                        fullBitmap?.asImageBitmap() ?: cachedThumb
+                    }
+
                     when {
-                        isLoading -> {
-                            CircularProgressIndicator(
-                                color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(44.dp)
-                            )
-                        }
                         isVideo -> {
                             Box(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (videoThumb != null) {
+                                if (cachedThumb != null) {
                                     Image(
-                                        bitmap = videoThumb!!,
+                                        bitmap = cachedThumb!!,
                                         contentDescription = pageItem.fileName,
                                         contentScale = ContentScale.Fit,
                                         modifier = Modifier
@@ -341,7 +392,7 @@ fun PhotoViewerScreen(
                                     ) {
                                         Icon(
                                             imageVector = Icons.Default.PlayArrow,
-                                            contentDescription = "Play Encrypted Video",
+                                            contentDescription = "Play Video",
                                             tint = Color.White,
                                             modifier = Modifier.size(44.dp)
                                         )
@@ -357,7 +408,7 @@ fun PhotoViewerScreen(
                                             text = if (pageItem.durationMs > 0) {
                                                 "Tap to Play Video (${formatDuration(pageItem.durationMs)})"
                                             } else {
-                                                "Tap to Play Encrypted Video"
+                                                "Tap to Play Video"
                                             },
                                             color = Color.White,
                                             fontSize = 12.sp,
@@ -367,9 +418,10 @@ fun PhotoViewerScreen(
                                 }
                             }
                         }
-                        fullBitmap != null -> {
+                        displayImageBitmap != null -> {
+                            // Point 28 (Step 1): Immediately renders cachedThumb placeholder and seamlessly upgrades to fullBitmap
                             Image(
-                                bitmap = fullBitmap!!.asImageBitmap(),
+                                bitmap = displayImageBitmap,
                                 contentDescription = pageItem.fileName,
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier
@@ -383,9 +435,15 @@ fun PhotoViewerScreen(
                                     )
                             )
                         }
+                        isLoading -> {
+                            CircularProgressIndicator(
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(44.dp)
+                            )
+                        }
                         else -> {
                             Text(
-                                text = "Unable to decode encrypted media",
+                                text = "Unable to decode media file",
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
@@ -393,7 +451,7 @@ fun PhotoViewerScreen(
                 }
             }
 
-            // Top Overlay Bar
+            // Top Overlay Bar (auto-hidden when Slideshow is active unless tapped)
             AnimatedVisibility(
                 visible = isControlsVisible,
                 enter = fadeIn(),
@@ -405,7 +463,7 @@ fun PhotoViewerScreen(
                         .fillMaxWidth()
                         .background(
                             Brush.verticalGradient(
-                                listOf(Color.Black.copy(alpha = 0.8f), Color.Transparent)
+                                listOf(Color.Black.copy(alpha = 0.75f), Color.Transparent)
                             )
                         )
                         .statusBarsPadding()
@@ -465,7 +523,8 @@ fun PhotoViewerScreen(
                 }
             }
 
-            // Bottom Actions Bar
+            // Point 28 (Step 3): Bottom Actions Bar with Safe Generous Spacing between Unhide and Delete
+            // Unhide is placed on the far left, Favorite in the center, and Delete on the far right!
             AnimatedVisibility(
                 visible = isControlsVisible,
                 enter = fadeIn(),
@@ -481,74 +540,185 @@ fun PhotoViewerScreen(
                             )
                         )
                         .navigationBarsPadding()
-                        .padding(horizontal = 24.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
+                        .padding(horizontal = 32.dp, vertical = 14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Heart Favorite
-                    IconButton(
-                        onClick = {
-                            val nextFav = !currentFavorite
-                            favoriteMap[currentItem.id] = nextFav
-                            onToggleFavorite(currentItem.copy(isFavorite = nextFav))
-                        },
-                        modifier = Modifier.testTag("heart_photo")
+                    // Far Left: Point 10 & Point 28 — Clean LockOpen Icon + Confirmation + Contextual PIN Gate
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { showUnhideConfirmDialog = true }
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .testTag("unhide_photo")
+                    ) {
+                        Icon(
+                            Icons.Default.LockOpen,
+                            contentDescription = "Unhide & Restore",
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Unhide",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+
+                    // Center: Heart Favorite
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable {
+                                val nextFav = !currentFavorite
+                                favoriteMap[currentItem.id] = nextFav
+                                onToggleFavorite(currentItem.copy(isFavorite = nextFav))
+                            }
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .testTag("heart_photo")
                     ) {
                         Icon(
                             imageVector = if (currentFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                             contentDescription = "Favorite",
                             tint = if (currentFavorite) Color(0xFFFF4757) else Color.White
                         )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Favorite",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
                     }
 
-                    // Unhide to Public Gallery
-                    IconButton(
-                        onClick = { onUnhide(currentItem) },
-                        modifier = Modifier.testTag("unhide_photo")
+                    // Far Right: Point 9 & Point 28 — Delete Permanently (widely separated from Unhide)
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { showDeleteConfirmDialog = true }
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .testTag("delete_photo")
                     ) {
-                        Icon(Icons.Default.Unpublished, "Unhide", tint = MaterialTheme.colorScheme.secondary)
-                    }
-
-                    // Delete Permanently (with Confirmation Dialog)
-                    IconButton(
-                        onClick = { showDeleteConfirmDialog = true },
-                        modifier = Modifier.testTag("delete_photo")
-                    ) {
-                        Icon(Icons.Default.Delete, "Delete Permanently", tint = MaterialTheme.colorScheme.error)
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Delete Permanently",
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Delete",
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
                     }
                 }
             }
         }
     }
 
-    // Confirmation Dialog before permanent deletion
+    // Point 10: Step 1 Confirmation Dialog before Unhide -> Step 2 Contextual PIN Gate
+    if (showUnhideConfirmDialog) {
+        val targetItem = currentItem
+        AlertDialog(
+            onDismissRequest = { showUnhideConfirmDialog = false },
+            shape = RoundedCornerShape(16.dp),
+            title = { Text("Unhide Media?", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Unhide and restore '${targetItem.fileName}' to your phone?"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showUnhideConfirmDialog = false
+                        pendingPinActionTitle = "Confirm Unhide Media"
+                        pendingPinActionCallback = {
+                            onUnhide(targetItem)
+                        }
+                    }
+                ) {
+                    Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Verify PIN & Unhide")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUnhideConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Point 9: Step 1 Confirmation Dialog before permanent deletion -> Step 2 Contextual PIN Gate
     if (showDeleteConfirmDialog) {
+        val targetItem = currentItem
         AlertDialog(
             onDismissRequest = { showDeleteConfirmDialog = false },
             shape = RoundedCornerShape(16.dp),
-            title = { Text("Delete Media Permanently?", fontWeight = FontWeight.Bold) },
+            title = { Text("Delete selected item(s) permanently?", fontWeight = FontWeight.Bold) },
             text = {
                 Text(
-                    "Are you sure you want to permanently destroy '${currentItem.fileName}' from your encrypted vault? This action cannot be undone."
+                    "Are you sure you want to delete '${targetItem.fileName}' permanently from your Vault? This action cannot be undone."
                 )
             },
             confirmButton = {
                 Button(
                     onClick = {
                         showDeleteConfirmDialog = false
-                        onDelete(currentItem)
+                        pendingPinActionTitle = "Delete Permanently"
+                        pendingPinActionCallback = {
+                            onDelete(targetItem)
+                        }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 ) {
                     Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Delete Forever")
+                    Text("Delete Permanently")
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirmDialog = false }) {
                     Text("Cancel")
                 }
+            }
+        )
+    }
+
+    // Point 7 & Point 8: Context-Aware CustomPinKeypadDialog (Folder's PIN if inside custom-locked folder, else Main PIN)
+    if (pendingPinActionTitle != null && pendingPinActionCallback != null) {
+        val itemFolder = remember(currentItem.folderId, folders) {
+            currentItem.folderId?.let { id -> folders.find { it.id == id } }
+        }
+        val usesCustomFolderPin = itemFolder != null && itemFolder.hasCustomPin()
+
+        CustomPinKeypadDialog(
+            title = if (usesCustomFolderPin) "Unlock '${itemFolder!!.folderName}'" else pendingPinActionTitle!!,
+            subtitle = if (usesCustomFolderPin) {
+                "Enter '${itemFolder!!.folderName}' Folder PIN and tap Unlock (✓)"
+            } else {
+                "Enter your Vault PIN and tap Unlock (✓)"
+            },
+            doneButtonLabel = "Unlock",
+            onVerifyPin = { inputPin ->
+                onVerifyContextualPin(currentItem.folderId, inputPin)
+            },
+            onSuccess = {
+                val callback = pendingPinActionCallback
+                pendingPinActionTitle = null
+                pendingPinActionCallback = null
+                callback?.invoke()
+            },
+            onDismiss = {
+                pendingPinActionTitle = null
+                pendingPinActionCallback = null
             }
         )
     }
@@ -571,4 +741,3 @@ private fun fromHex(hex: String): ByteArray {
     }
     return data
 }
-

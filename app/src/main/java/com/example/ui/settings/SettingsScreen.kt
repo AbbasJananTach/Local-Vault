@@ -28,7 +28,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GridView
@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.LockClock
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
@@ -46,17 +47,18 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -65,7 +67,6 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -79,11 +80,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.example.data.AutoLockMode
 import com.example.data.DeviceFolderSummary
-import com.example.data.ThumbnailCacheManager
 import com.example.data.VaultPreferences
 import com.example.data.VaultStorage
+import com.example.ui.components.CustomPinKeypadDialog
+import com.example.ui.components.CustomPinSetupDialog
 import com.example.ui.theme.CrimsonPrimary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.VaultThemeMode
@@ -95,6 +99,8 @@ import java.io.File
 fun SettingsScreen(
     onBack: () -> Unit,
     vaultStorage: VaultStorage? = null,
+    isDecoyMode: Boolean = false,
+    onVerifyCurrentPin: (String) -> Boolean = { true },
     // Security callbacks
     onChangeMasterPin: (oldPin: String, newPin: String) -> Boolean,
     onUpdateRecoveryPhrase: (newPhrase: String) -> Boolean,
@@ -133,7 +139,8 @@ fun SettingsScreen(
 ) {
     BackHandler { onBack() }
 
-    var showChangePinDialog by remember { mutableStateOf(false) }
+    var showVerifyCurrentPinForChange by remember { mutableStateOf(false) }
+    var verifiedOldPinForChange by remember { mutableStateOf<String?>(null) }
     var showRecoveryPhraseDialog by remember { mutableStateOf(false) }
     var showFakePinDialog by remember { mutableStateOf(false) }
     var showVisualFolderPickerSheet by remember { mutableStateOf(false) }
@@ -251,18 +258,23 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(14.dp))
 
                     Text(
-                        "Default Grid Columns",
+                        "Thumbnail Grid Size",
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(2, 3, 4, 5).forEach { cols ->
+                        listOf(
+                            4 to "Small",
+                            3 to "Medium",
+                            2 to "Large"
+                        ).forEach { (cols, label) ->
+                            val isSelected = defaultGridColumns.coerceIn(2, 4) == cols
                             FilterChip(
-                                selected = defaultGridColumns == cols,
+                                selected = isSelected,
                                 onClick = { onDefaultGridColumnsChanged(cols) },
-                                label = { Text("$cols Cols") },
-                                leadingIcon = if (defaultGridColumns == cols) {
+                                label = { Text("$label ($cols)") },
+                                leadingIcon = if (isSelected) {
                                     { Icon(Icons.Default.GridView, null, modifier = Modifier.size(16.dp)) }
                                 } else null
                             )
@@ -335,7 +347,7 @@ fun SettingsScreen(
                 }
             }
 
-            // 3. SECURITY & DUAL-KEY WRAPPING CONTROLS
+            // 3. SECURITY & VAULT LOCK CONTROLS (Point 12 & Point 20: Clean everyday English, hide decoy options in Decoy Mode)
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -345,21 +357,27 @@ fun SettingsScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Security, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            "Security & Cryptography",
-                            fontWeight = FontWeight.Bold,
-                            style = MaterialTheme.typography.titleMedium
-                        )
+                        Column {
+                            Text(
+                                "Secure Vault Lock",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                "Screenshots are blocked for your privacy",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
                     }
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    // Change Master PIN & Update Recovery Phrase Buttons
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Button(
-                            onClick = { showChangePinDialog = true },
+                            onClick = { showVerifyCurrentPinForChange = true },
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("change_master_pin_button")
@@ -369,248 +387,242 @@ fun SettingsScreen(
                             Text("Change PIN")
                         }
 
-                        OutlinedButton(
-                            onClick = { showRecoveryPhraseDialog = true },
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("update_recovery_phrase_button")
-                        ) {
-                            Text(if (hasRecoveryPhrase) "Update Phrase" else "Set Phrase")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // Decoy / Fake PIN Mode
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Decoy / Fake PIN Vault", fontWeight = FontWeight.SemiBold)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(
-                                            if (hasDecoyPin) MaterialTheme.colorScheme.secondaryContainer
-                                            else MaterialTheme.colorScheme.surfaceContainerHigh
-                                        )
-                                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                                ) {
-                                    Text(
-                                        text = if (hasDecoyPin) "ACTIVE" else "OFF",
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (hasDecoyPin) MaterialTheme.colorScheme.onSecondaryContainer
-                                        else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            Text(
-                                "Secondary PIN that opens an isolated decoy gallery",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(
-                            onClick = { showFakePinDialog = true },
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("setup_fake_pin")
-                        ) {
-                            Text(if (hasDecoyPin) "Change Decoy PIN" else "Enable Decoy PIN")
-                        }
-                        if (hasDecoyPin) {
+                        if (!isDecoyMode) {
                             OutlinedButton(
-                                onClick = onRemoveFakePin,
+                                onClick = { showRecoveryPhraseDialog = true },
                                 modifier = Modifier
                                     .weight(1f)
-                                    .testTag("remove_fake_pin"),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    contentColor = MaterialTheme.colorScheme.error
-                                )
+                                    .testTag("update_recovery_phrase_button")
                             ) {
-                                Text("Disable Decoy")
+                                Text(if (hasRecoveryPhrase) "Update Phrase" else "Set Phrase")
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                    Spacer(modifier = Modifier.height(12.dp))
+                    if (!isDecoyMode) {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                        Spacer(modifier = Modifier.height(14.dp))
 
-                    // Brute-force 1-hour lockout toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("1-Hour Brute-Force Lockout", fontWeight = FontWeight.Medium)
-                            Text(
-                                "Lock keypad for 60 minutes after 3 wrong PIN attempts",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                        // Decoy PIN Setup (Hidden in Decoy Mode so decoy space is completely undetectable)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Decoy PIN Setup", fontWeight = FontWeight.SemiBold)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(
+                                                if (hasDecoyPin) MaterialTheme.colorScheme.secondaryContainer
+                                                else MaterialTheme.colorScheme.surfaceContainerHigh
+                                            )
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = if (hasDecoyPin) "ACTIVE" else "OFF",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (hasDecoyPin) MaterialTheme.colorScheme.onSecondaryContainer
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                Text(
+                                    "Secondary PIN that opens a separate space titled 'Local Vault'",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { showFakePinDialog = true },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("setup_fake_pin")
+                            ) {
+                                Text(if (hasDecoyPin) "Change Decoy PIN" else "Enable Decoy PIN")
+                            }
+                            if (hasDecoyPin) {
+                                OutlinedButton(
+                                    onClick = onRemoveFakePin,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("remove_fake_pin"),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = MaterialTheme.colorScheme.error
+                                    )
+                                ) {
+                                    Text("Disable Decoy")
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // 1-Hour Lockout toggle
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("1-Hour Security Lockout", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Lock keypad for 60 minutes after 3 wrong PIN attempts",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = bruteForceLockoutEnabled,
+                                onCheckedChange = onToggleBruteForceLockout
                             )
                         }
-                        Switch(
-                            checked = bruteForceLockoutEnabled,
-                            onCheckedChange = onToggleBruteForceLockout
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    // Block Screenshots & Screen Recording (FLAG_SECURE)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Block Screenshots & Recording", fontWeight = FontWeight.Medium)
-                            Text(
-                                "Enforce FLAG_SECURE to prevent screenshots, screen recording, and Recent Apps previews",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = blockScreenshots,
-                            onCheckedChange = onToggleBlockScreenshots,
-                            modifier = Modifier.testTag("toggle_flag_secure")
-                        )
                     }
                 }
             }
 
-            // 4. BACKGROUND AUTO-HIDE FOLDER WATCHER (WITH VISUAL FOLDER PICKER)
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(modifier = Modifier.padding(18.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                            Icon(Icons.Default.VisibilityOff, null, tint = MaterialTheme.colorScheme.primary)
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Column {
-                                Text(
-                                    "Background Auto-Hide Watcher",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                                Text(
-                                    if (isAutoHideEnabled) "Active • Watching ${watchedFolders.size} folder(s)"
-                                    else "Stopped",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (isAutoHideEnabled) MaterialTheme.colorScheme.secondary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+            if (!isDecoyMode) {
+                // 4. BACKGROUND AUTO-HIDE FOLDER WATCHER (CLEAN SELECTED LIST + FULL-SCREEN FOLDER SEARCH)
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Default.VisibilityOff, null, tint = MaterialTheme.colorScheme.primary)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        "Background Auto-Hide Watcher",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.titleMedium
+                                    )
+                                    Text(
+                                        if (isAutoHideEnabled) "Active • Watching ${watchedFolders.size} folder(s)"
+                                        else "Stopped",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isAutoHideEnabled) MaterialTheme.colorScheme.secondary
+                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
+                            Switch(
+                                checked = isAutoHideEnabled,
+                                onCheckedChange = onToggleAutoHide,
+                                modifier = Modifier.testTag("autohide_switch")
+                            )
                         }
-                        Switch(
-                            checked = isAutoHideEnabled,
-                            onCheckedChange = onToggleAutoHide,
-                            modifier = Modifier.testTag("autohide_switch")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Selected device folders are monitored automatically. Any photo or video saved into these folders is encrypted into Local Vault and wiped from public gallery.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        "Select device folders to monitor. Any photo or video saved into checked folders is automatically encrypted into Local Vault and wiped from public gallery.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
 
-                    presetFolders.forEach { (label, path) ->
-                        val isChecked = watchedFolders.contains(path)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onToggleWatchedFolder(path) }
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = isChecked,
-                                onCheckedChange = { onToggleWatchedFolder(path) }
-                            )
-                            Column {
-                                Text(label, fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                                Text(
-                                    path,
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
+                        val presetLabelMap = remember(presetFolders) {
+                            presetFolders.associate { (label, path) -> path to label }
                         }
-                    }
-
-                    // Show any custom paths added by user via the visual folder picker
-                    val presetPathSet = presetFolders.map { it.second }.toSet()
-                    watchedFolders.filter { it !in presetPathSet }.forEach { customPath ->
-                        val folderTitle = File(customPath).name.ifBlank { "Custom Folder" }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onToggleWatchedFolder(customPath) }
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = true,
-                                onCheckedChange = { onToggleWatchedFolder(customPath) }
-                            )
-                            Column {
-                                Text(folderTitle, fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                                Text(
-                                    customPath,
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Button(
-                            onClick = { showVisualFolderPickerSheet = true },
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("browse_watched_folders_button")
-                        ) {
-                            Icon(Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Browse Device Folders")
+                        val sortedWatched = remember(watchedFolders) {
+                            watchedFolders.sortedBy { File(it).name.lowercase() }
                         }
 
-                        if (watchedFolders.isNotEmpty()) {
-                            OutlinedButton(
-                                onClick = onSweepWatchedFoldersNow,
-                                modifier = Modifier.testTag("sweep_watched_now_button")
+                        if (sortedWatched.isEmpty()) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                                ),
+                                shape = RoundedCornerShape(10.dp)
                             ) {
-                                Icon(Icons.Default.Sync, null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Sweep Now")
+                                Text(
+                                    text = "No folders selected for Auto-Hide. Tap 'Add More Folders' below to search and select folders.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            }
+                        } else {
+                            sortedWatched.forEach { folderPath ->
+                                val folderTitle = presetLabelMap[folderPath]
+                                    ?: File(folderPath).name.ifBlank { "Watched Folder" }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onToggleWatchedFolder(folderPath) }
+                                        .padding(vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Checkbox(
+                                        checked = true,
+                                        onCheckedChange = { onToggleWatchedFolder(folderPath) }
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(folderTitle, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                                        Text(
+                                            folderPath,
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = { onToggleWatchedFolder(folderPath) },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Close,
+                                            contentDescription = "Remove Watched Folder",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Button(
+                                onClick = { showVisualFolderPickerSheet = true },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("browse_watched_folders_button")
+                            ) {
+                                Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Add More Folders")
+                            }
+
+                            if (watchedFolders.isNotEmpty()) {
+                                OutlinedButton(
+                                    onClick = onSweepWatchedFoldersNow,
+                                    modifier = Modifier.testTag("sweep_watched_now_button")
+                                ) {
+                                    Icon(Icons.Default.Sync, null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Sweep Now")
+                                }
                             }
                         }
                     }
@@ -628,47 +640,50 @@ fun SettingsScreen(
                         Icon(Icons.Default.Storage, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
-                            "Offline Backup (.lvb) & Vault Summary",
+                            if (isDecoyMode) "Vault Storage Summary" else "Offline Backup (.lvb) & Vault Summary",
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleMedium
                         )
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        "Package your encrypted vault database, folder structure, and encrypted blobs into a single binary .lvb file, or safely restore/merge a backup without deleting existing files.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Button(
-                            onClick = onCreateBackup,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("create_backup_button")
+                    if (!isDecoyMode) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Save a complete backup of your Vault folders and media into a single .lvb file, or safely restore a backup without deleting existing files.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Icon(Icons.Default.Backup, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Export .lvb Backup")
+                            Button(
+                                onClick = onCreateBackup,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("create_backup_button")
+                            ) {
+                                Icon(Icons.Default.Backup, null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Export .lvb Backup")
+                            }
+                            Button(
+                                onClick = onRestoreBackup,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("restore_backup_button")
+                            ) {
+                                Icon(Icons.Default.Restore, null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Restore .lvb Backup")
+                            }
                         }
-                        Button(
-                            onClick = onRestoreBackup,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("restore_backup_button")
-                        ) {
-                            Icon(Icons.Default.Restore, null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Restore .lvb Backup")
-                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
                     }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Column {
@@ -692,70 +707,44 @@ fun SettingsScreen(
         }
     }
 
-    // Change Master PIN Dialog
-    if (showChangePinDialog) {
-        var currentPin by remember { mutableStateOf("") }
-        var newPin by remember { mutableStateOf("") }
-        var confirmPin by remember { mutableStateOf("") }
-        var errorMsg by remember { mutableStateOf("") }
+    // Point 7: Step 1 of Change Vault PIN — Verify Current PIN via In-App 3x4 Keypad
+    if (showVerifyCurrentPinForChange) {
+        var latestVerifiedPin by remember { mutableStateOf("") }
+        CustomPinKeypadDialog(
+            title = "Enter Current Vault PIN",
+            subtitle = "Verify your current PIN and tap Unlock (✓)",
+            doneButtonLabel = "Unlock",
+            onVerifyPin = { inputPin ->
+                val ok = onVerifyCurrentPin(inputPin)
+                if (ok) {
+                    latestVerifiedPin = inputPin
+                }
+                ok
+            },
+            onSuccess = {
+                showVerifyCurrentPinForChange = false
+                verifiedOldPinForChange = latestVerifiedPin
+            },
+            onDismiss = { showVerifyCurrentPinForChange = false }
+        )
+    }
 
-        AlertDialog(
-            onDismissRequest = { showChangePinDialog = false },
-            title = { Text("Change Master Vault PIN", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = currentPin,
-                        onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) currentPin = it },
-                        label = { Text("Current Master PIN") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = newPin,
-                        onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) newPin = it },
-                        label = { Text("New Master PIN (1-10 digits)") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = confirmPin,
-                        onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) confirmPin = it },
-                        label = { Text("Confirm New Master PIN") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (errorMsg.isNotEmpty()) {
-                        Text(errorMsg, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
+    // Point 7: Step 2 of Change Vault PIN — Enter & Confirm New PIN via In-App 3x4 Keypad
+    if (verifiedOldPinForChange != null) {
+        val oldPin = verifiedOldPinForChange!!
+        CustomPinSetupDialog(
+            title = "New Vault PIN",
+            step1Subtitle = "Enter a new 1 to 10 digit PIN, then tap Done (✓)",
+            step2Subtitle = "Re-enter the new PIN to confirm, then tap Done (✓)",
+            onPinConfirmed = { newPin ->
+                val ok = onChangeMasterPin(oldPin, newPin)
+                if (ok) {
+                    verifiedOldPinForChange = null
                 }
+                ok
             },
-            confirmButton = {
-                Button(onClick = {
-                    if (newPin.isEmpty()) {
-                        errorMsg = "New PIN cannot be empty"
-                        return@Button
-                    }
-                    if (newPin != confirmPin) {
-                        errorMsg = "New PINs do not match"
-                        return@Button
-                    }
-                    val ok = onChangeMasterPin(currentPin, newPin)
-                    if (ok) {
-                        showChangePinDialog = false
-                    } else {
-                        errorMsg = "Current Master PIN is incorrect"
-                    }
-                }) {
-                    Text("Update PIN")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showChangePinDialog = false }) { Text("Cancel") }
-            }
+            mismatchOrInvalidError = "New PIN cannot conflict with another PIN.",
+            onDismiss = { verifiedOldPinForChange = null }
         )
     }
 
@@ -770,7 +759,7 @@ fun SettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "Your recovery phrase wraps Slot B of your 256-bit Master Vault Key so you can recover access if you forget your PIN.",
+                        "Your recovery phrase lets you unlock your Secure Vault Lock if you ever forget your PIN.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     OutlinedTextField(
@@ -806,76 +795,27 @@ fun SettingsScreen(
         )
     }
 
-    // Decoy / Fake PIN Setup Dialog
-    if (showFakePinDialog) {
-        var inputFakePin by remember { mutableStateOf("") }
-        var confirmFakePin by remember { mutableStateOf("") }
-        var errorMsg by remember { mutableStateOf("") }
-
-        AlertDialog(
-            onDismissRequest = { showFakePinDialog = false },
-            title = { Text("Configure Decoy PIN", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        "Enter a numeric Decoy PIN (different from your Real PIN). Unlocking with this PIN opens an isolated decoy gallery.",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    OutlinedTextField(
-                        value = inputFakePin,
-                        onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) inputFakePin = it },
-                        label = { Text("Decoy PIN (1-10 digits)") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("fake_pin_input")
-                    )
-                    OutlinedTextField(
-                        value = confirmFakePin,
-                        onValueChange = { if (it.length <= 10 && it.all { c -> c.isDigit() }) confirmFakePin = it },
-                        label = { Text("Confirm Decoy PIN") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (errorMsg.isNotEmpty()) {
-                        Text(errorMsg, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
+    // Point 7: Decoy / Fake PIN Setup Dialog using In-App 3x4 Custom Numeric Keypad
+    if (showFakePinDialog && !isDecoyMode) {
+        CustomPinSetupDialog(
+            title = "Decoy PIN",
+            step1Subtitle = "Enter a 1 to 10 digit Decoy PIN (different from your Master PIN), then tap Done (✓)",
+            step2Subtitle = "Re-enter the Decoy PIN to confirm, then tap Done (✓)",
+            onPinConfirmed = { fakePin ->
+                val ok = onSetupFakePin(fakePin)
+                if (ok) {
+                    showFakePinDialog = false
                 }
+                ok
             },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (inputFakePin.isEmpty()) {
-                            errorMsg = "Enter at least 1 digit"
-                            return@Button
-                        }
-                        if (inputFakePin != confirmFakePin) {
-                            errorMsg = "Decoy PINs do not match"
-                            return@Button
-                        }
-                        if (onSetupFakePin(inputFakePin)) {
-                            showFakePinDialog = false
-                        } else {
-                            errorMsg = "Decoy PIN must be different from your Real Master PIN"
-                        }
-                    }
-                ) {
-                    Text("Save Decoy PIN")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showFakePinDialog = false }) {
-                    Text("Cancel")
-                }
-            }
+            mismatchOrInvalidError = "Decoy PIN must be different from your Real Master PIN",
+            onDismiss = { showFakePinDialog = false }
         )
     }
 
-    // Visual Device Folder Browser Sheet for Auto-Hide
+    // Full-Screen Device Folder Search & Selection Dialog for Auto-Hide (Point 5)
     if (showVisualFolderPickerSheet) {
-        VisualWatchedFolderPickerSheet(
+        FullScreenFolderSearchDialog(
             vaultStorage = vaultStorage,
             watchedFolders = watchedFolders,
             onToggleWatchedFolder = onToggleWatchedFolder,
@@ -885,272 +825,255 @@ fun SettingsScreen(
     }
 }
 
+/**
+ * Point 5: Full-Screen Folder Search Dialog for Auto-Hide Settings.
+ * - Features a top Search Bar with a one-tap `X` clear button.
+ * - Traverses `/storage/emulated/0` (excluding `/Android/data` and `/Android/obb`) on `Dispatchers.IO`
+ *   via `File.listFiles()` so ALL folders on the phone—including completely empty folders—appear
+ *   and can be searched by name or path and selected.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun VisualWatchedFolderPickerSheet(
+private fun FullScreenFolderSearchDialog(
     vaultStorage: VaultStorage?,
     watchedFolders: Set<String>,
     onToggleWatchedFolder: (String) -> Unit,
     onAddCustomWatchedFolder: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Detected Media Folders, 1 = Browse Storage Tree
-    var detectedFolders by remember { mutableStateOf<List<DeviceFolderSummary>>(emptyList()) }
-    val rootStoragePath = remember {
-        Environment.getExternalStorageDirectory().absolutePath.ifBlank { "/storage/emulated/0" }
-    }
-    var currentBrowsePath by remember { mutableStateOf(rootStoragePath) }
-    var subdirectories by remember { mutableStateOf<List<File>>(emptyList()) }
+    var searchQuery by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(true) }
+    var allDeviceFolders by remember { mutableStateOf<List<DeviceFolderSummary>>(emptyList()) }
 
     LaunchedEffect(vaultStorage) {
+        isLoading = true
         if (vaultStorage != null) {
-            detectedFolders = vaultStorage.queryAllDeviceMediaFoldersWithPaths()
+            allDeviceFolders = vaultStorage.scanAllDeviceFoldersForSearch()
+        }
+        isLoading = false
+    }
+
+    val filteredFolders = remember(allDeviceFolders, searchQuery) {
+        val q = searchQuery.trim()
+        if (q.isEmpty()) {
+            allDeviceFolders
+        } else {
+            allDeviceFolders.filter {
+                it.name.contains(q, ignoreCase = true) || it.path.contains(q, ignoreCase = true)
+            }
         }
     }
 
-    LaunchedEffect(vaultStorage, currentBrowsePath) {
-        subdirectories = vaultStorage?.listSubdirectories(currentBrowsePath)
-            ?: File(currentBrowsePath).listFiles()
-                ?.filter { it.isDirectory && !it.name.startsWith(".") }
-                ?.sortedBy { it.name.lowercase() }
-            ?: emptyList()
-    }
-
-    ModalBottomSheet(
+    Dialog(
         onDismissRequest = onDismiss,
-        containerColor = MaterialTheme.colorScheme.surface
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(600.dp)
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp)
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
         ) {
-            Text(
-                text = "Select Device Folders to Auto-Hide",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = "Check any folder below. Photos & videos inside checked folders are automatically encrypted into Local Vault.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    label = { Text("Detected Media Folders (${detectedFolders.size})") },
-                    leadingIcon = { Icon(Icons.Default.Folder, null, modifier = Modifier.size(16.dp)) }
-                )
-                FilterChip(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    label = { Text("Browse Storage") },
-                    leadingIcon = { Icon(Icons.Default.FolderOpen, null, modifier = Modifier.size(16.dp)) }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            if (selectedTab == 0) {
-                if (detectedFolders.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                "No media folders detected yet or storage is empty.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            OutlinedButton(onClick = { selectedTab = 1 }) {
-                                Text("Browse Storage Directories Instead")
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.surface
+                        ),
+                        title = {
+                            Column {
+                                Text(
+                                    text = "Add Auto-Hide Folders",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Text(
+                                    text = "${watchedFolders.size} selected • ${allDeviceFolders.size} device folders found",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                        },
+                        navigationIcon = {
+                            IconButton(
+                                onClick = onDismiss,
+                                modifier = Modifier.testTag("folder_search_back_button")
+                            ) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            }
+                        },
+                        actions = {
+                            TextButton(
+                                onClick = onDismiss,
+                                modifier = Modifier.testTag("folder_search_done_button")
+                            ) {
+                                Text("Done", fontWeight = FontWeight.Bold)
                             }
                         }
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(detectedFolders, key = { it.path }) { folderSummary ->
-                            val isChecked = watchedFolders.contains(folderSummary.path)
-                            Card(
-                                onClick = {
-                                    if (isChecked) onToggleWatchedFolder(folderSummary.path)
-                                    else onAddCustomWatchedFolder(folderSummary.path)
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = if (isChecked) {
-                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceContainerHigh
-                                    }
-                                )
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                    )
+                }
+            ) { innerPadding ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .navigationBarsPadding()
+                        .padding(horizontal = 16.dp)
+                ) {
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Top Search Bar with One-Tap 'X' Clear Button
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("Search any folder name or path...") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        leadingIcon = {
+                            Icon(Icons.Default.Search, contentDescription = null)
+                        },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(
+                                    onClick = { searchQuery = "" },
+                                    modifier = Modifier.testTag("folder_search_clear_button")
                                 ) {
-                                    Checkbox(
-                                        checked = isChecked,
-                                        onCheckedChange = {
-                                            if (isChecked) onToggleWatchedFolder(folderSummary.path)
-                                            else onAddCustomWatchedFolder(folderSummary.path)
+                                    Icon(Icons.Default.Close, contentDescription = "Clear Search")
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("folder_search_input")
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    if (isLoading) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator()
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "Scanning device storage folders...",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    } else if (filteredFolders.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.FolderOpen,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(48.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = if (searchQuery.isNotBlank()) "No folders matching '$searchQuery'"
+                                    else "No device folders found",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(filteredFolders, key = { it.path }) { folderSummary ->
+                                val isChecked = watchedFolders.contains(folderSummary.path)
+                                Card(
+                                    onClick = {
+                                        if (isChecked) onToggleWatchedFolder(folderSummary.path)
+                                        else onAddCustomWatchedFolder(folderSummary.path)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isChecked) {
+                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceContainerHigh
                                         }
                                     )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Checkbox(
+                                            checked = isChecked,
+                                            onCheckedChange = {
+                                                if (isChecked) onToggleWatchedFolder(folderSummary.path)
+                                                else onAddCustomWatchedFolder(folderSummary.path)
+                                            }
+                                        )
+                                        Icon(
+                                            Icons.Default.Folder,
+                                            contentDescription = null,
+                                            tint = if (isChecked) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = folderSummary.name,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    fontSize = 15.sp,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    text = if (folderSummary.mediaCount > 0) "${folderSummary.mediaCount} media"
+                                                    else "Empty folder",
+                                                    fontSize = 11.sp,
+                                                    color = if (folderSummary.mediaCount > 0) MaterialTheme.colorScheme.primary
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    fontWeight = FontWeight.Medium
+                                                )
+                                            }
                                             Text(
-                                                text = folderSummary.name,
-                                                fontWeight = FontWeight.SemiBold,
-                                                fontSize = 15.sp,
+                                                text = folderSummary.path,
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis
                                             )
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Text(
-                                                text = "${folderSummary.mediaCount} files",
-                                                fontSize = 11.sp,
-                                                color = MaterialTheme.colorScheme.primary,
-                                                fontWeight = FontWeight.Bold
-                                            )
                                         }
-                                        Text(
-                                            text = folderSummary.path,
-                                            fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
                                     }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                // Interactive Directory Tree Explorer
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                ) {
-                    Row(
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onDismiss,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                            .padding(bottom = 12.dp)
+                            .height(50.dp)
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Current Folder:",
-                                fontSize = 10.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Text(
-                                text = currentBrowsePath,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        if (currentBrowsePath != rootStoragePath && File(currentBrowsePath).parent != null) {
-                            TextButton(
-                                onClick = {
-                                    currentBrowsePath = File(currentBrowsePath).parent ?: rootStoragePath
-                                }
-                            ) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Up")
-                            }
-                        }
+                        Text("Done (${watchedFolders.size} Selected)", fontWeight = FontWeight.Bold)
                     }
                 }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                LazyColumn(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(subdirectories, key = { it.absolutePath }) { dir ->
-                        val path = dir.absolutePath
-                        val isChecked = watchedFolders.contains(path)
-                        Card(
-                            onClick = { currentBrowsePath = path },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isChecked) {
-                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                                } else {
-                                    MaterialTheme.colorScheme.surfaceContainerHigh
-                                }
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Checkbox(
-                                    checked = isChecked,
-                                    onCheckedChange = {
-                                        if (isChecked) onToggleWatchedFolder(path)
-                                        else onAddCustomWatchedFolder(path)
-                                    }
-                                )
-                                Icon(
-                                    Icons.Default.Folder,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = dir.name,
-                                        fontWeight = FontWeight.SemiBold,
-                                        fontSize = 14.sp
-                                    )
-                                    Text(
-                                        text = "Tap to open • Check box to watch folder",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-            Button(
-                onClick = onDismiss,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 12.dp)
-                    .height(48.dp)
-            ) {
-                Text("Done (${watchedFolders.size} Watched Folder(s))", fontWeight = FontWeight.Bold)
             }
         }
     }

@@ -6,23 +6,20 @@ import android.os.Environment
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import java.io.File
 
 /**
- * Architectural Persistence Fix:
- * Stores `local_vault.db` directly inside the persistent external `/storage/emulated/0/.LocalVaultData/`
- * directory whenever All Files Access (`MANAGE_EXTERNAL_STORAGE`) is granted.
- *
- * Why:
- * Internal app storage (`/data/data/.../databases/local_vault.db`) is wiped by the Android OS upon
- * app uninstallation, which would orphan `.LocalVaultData/blobs/<uuid>.bin` by losing their `baseIvHex`,
- * original filenames, and folder mappings. Placing the database inside `.LocalVaultData/local_vault.db`
- * (using `JournalMode.TRUNCATE` for single-file FUSE reliability) ensures 100% survival across
- * app uninstalls and reinstalls.
+ * Architectural Persistence & De-duplication Fix:
+ * 1. Stores `local_vault.db` directly inside `/storage/emulated/0/.LocalVaultData/` whenever
+ *    All Files Access (`MANAGE_EXTERNAL_STORAGE`) is granted.
+ * 2. Includes non-destructive `MIGRATION_1_2` that cleans up any pre-existing duplicate rows sharing
+ *    the same `encryptedRelativePath` before creating the unique index `index_vault_items_encryptedRelativePath`.
  */
 @Database(
     entities = [VaultItem::class, FolderItem::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class VaultDatabase : RoomDatabase() {
@@ -35,6 +32,26 @@ abstract class VaultDatabase : RoomDatabase() {
 
         @Volatile
         private var currentDbPath: String? = null
+
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Remove any duplicate metadata rows pointing to the same physical encrypted file
+                db.execSQL(
+                    """
+                    DELETE FROM vault_items
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM vault_items
+                        GROUP BY encryptedRelativePath
+                    )
+                    """.trimIndent()
+                )
+                // Create the unique index on encryptedRelativePath
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_vault_items_encryptedRelativePath` ON `vault_items` (`encryptedRelativePath`)"
+                )
+            }
+        }
 
         private fun resolveDatabasePath(context: Context): String {
             val hasAllFilesAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -75,8 +92,6 @@ abstract class VaultDatabase : RoomDatabase() {
                     return@synchronized curr
                 }
 
-                // If transitioning from internal fallback to persistent external DB after permission grant,
-                // close the temporary fallback instance cleanly.
                 try {
                     curr?.close()
                 } catch (_: Exception) {
@@ -87,6 +102,7 @@ abstract class VaultDatabase : RoomDatabase() {
                     VaultDatabase::class.java,
                     recheckTarget
                 )
+                    .addMigrations(MIGRATION_1_2)
                     .setJournalMode(JournalMode.TRUNCATE)
                     .fallbackToDestructiveMigration(true)
                     .build()

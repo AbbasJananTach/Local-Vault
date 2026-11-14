@@ -1,8 +1,6 @@
 package com.example.ui.auth
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,16 +14,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Backspace
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -35,6 +27,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,18 +37,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ui.components.AnimatedPinDotsDisplay
+import com.example.ui.components.CustomNumericKeypad
 import kotlinx.coroutines.delay
 
+/**
+ * Point 7: Vault Lock & First-Time Setup Screen.
+ * - Uses the in-app 3x4 `CustomNumericKeypad` (`1-9`, `Clear/Backspace ⌫`, `0`, and `Unlock / Done ✓`).
+ * - Strictly disables auto-submit on digit count: verification ONLY executes when the user
+ *   explicitly taps the `Unlock / Done (✓)` button.
+ * - When an incorrect PIN is submitted on `Unlock`, shakes the dot indicator, displays
+ *   `"Incorrect PIN"`, and clears the input.
+ */
 @Composable
 fun AuthScreen(
     isInitialized: Boolean,
     isLockedOut: Boolean,
     lockoutRemainingSeconds: Long,
-    onPinSubmit: (String) -> Unit,
+    onPinSubmit: (String) -> Boolean,
     onSetupCompleted: (pin: String, recoveryPhrase: String) -> Unit,
     onRecoveryPhraseSubmit: (String) -> Boolean,
     onResetPinConfirmed: (newPin: String) -> Unit,
@@ -63,10 +65,11 @@ fun AuthScreen(
 ) {
     var pinText by remember { mutableStateOf("") }
     var confirmPinText by remember { mutableStateOf("") }
-    var setupStep by remember { mutableStateOf(1) } // 1: Enter PIN, 2: Confirm PIN, 3: Recovery Phrase
+    var setupStep by remember { mutableIntStateOf(1) } // 1: Enter PIN, 2: Confirm PIN, 3: Recovery Phrase
     var firstEnteredPin by remember { mutableStateOf("") }
     var recoveryPhraseText by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf("") }
+    var shakeTrigger by remember { mutableIntStateOf(0) }
     var isRecoveryMode by remember { mutableStateOf(false) }
 
     var timerSeconds by remember(lockoutRemainingSeconds) { mutableLongStateOf(lockoutRemainingSeconds) }
@@ -105,7 +108,7 @@ fun AuthScreen(
                 tint = MaterialTheme.colorScheme.primary
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
             if (isLockedOut || timerSeconds > 0) {
                 // 1-HOUR HARDENED LOCKOUT UI
@@ -157,7 +160,10 @@ fun AuthScreen(
 
                 OutlinedTextField(
                     value = recoveryPhraseText,
-                    onValueChange = { recoveryPhraseText = it },
+                    onValueChange = {
+                        recoveryPhraseText = it
+                        errorMessage = ""
+                    },
                     label = { Text("Recovery Phrase") },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -167,7 +173,11 @@ fun AuthScreen(
 
                 if (errorMessage.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(text = errorMessage, color = MaterialTheme.colorScheme.error)
+                    Text(
+                        text = errorMessage,
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -175,7 +185,10 @@ fun AuthScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    TextButton(onClick = { isRecoveryMode = false }) {
+                    TextButton(onClick = {
+                        isRecoveryMode = false
+                        errorMessage = ""
+                    }) {
                         Text("Back to PIN")
                     }
                     Button(
@@ -193,7 +206,7 @@ fun AuthScreen(
                     }
                 }
             } else if (!isInitialized) {
-                // FIRST TIME SETUP FLOW
+                // FIRST TIME SETUP FLOW (In-App 3x4 Keypad for PIN, no system keyboard for PINs)
                 when (setupStep) {
                     1 -> {
                         Text(
@@ -203,25 +216,51 @@ fun AuthScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Enter 1 to 10 digits for your Vault PIN",
+                            text = "Enter 1 to 10 digits, then tap Done (✓)",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(24.dp))
-                        PinDotsDisplay(pinLength = pinText.length)
-                        Spacer(modifier = Modifier.height(28.dp))
-                        NumericKeypad(
+                        Spacer(modifier = Modifier.height(20.dp))
+                        AnimatedPinDotsDisplay(
+                            pinLength = pinText.length,
+                            shakeTrigger = shakeTrigger,
+                            isError = errorMessage.isNotEmpty()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Box(modifier = Modifier.height(20.dp), contentAlignment = Alignment.Center) {
+                            if (errorMessage.isNotEmpty()) {
+                                Text(
+                                    text = errorMessage,
+                                    color = MaterialTheme.colorScheme.error,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(14.dp))
+                        CustomNumericKeypad(
+                            doneLabel = "Done",
                             onDigitClick = { digit ->
+                                errorMessage = ""
                                 if (pinText.length < 10) pinText += digit
                             },
                             onBackspaceClick = {
+                                errorMessage = ""
                                 if (pinText.isNotEmpty()) pinText = pinText.dropLast(1)
+                            },
+                            onClearAllClick = {
+                                errorMessage = ""
+                                pinText = ""
                             },
                             onDoneClick = {
                                 if (pinText.isNotEmpty()) {
                                     firstEnteredPin = pinText
                                     pinText = ""
+                                    errorMessage = ""
                                     setupStep = 2
+                                } else {
+                                    errorMessage = "Enter at least 1 digit"
+                                    shakeTrigger++
                                 }
                             }
                         )
@@ -243,30 +282,49 @@ fun AuthScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Re-enter the exact same PIN to confirm",
+                            text = "Re-enter the exact same PIN, then tap Done (✓)",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        if (errorMessage.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(text = errorMessage, color = MaterialTheme.colorScheme.error)
+                        Spacer(modifier = Modifier.height(20.dp))
+                        AnimatedPinDotsDisplay(
+                            pinLength = confirmPinText.length,
+                            shakeTrigger = shakeTrigger,
+                            isError = errorMessage.isNotEmpty()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Box(modifier = Modifier.height(20.dp), contentAlignment = Alignment.Center) {
+                            if (errorMessage.isNotEmpty()) {
+                                Text(
+                                    text = errorMessage,
+                                    color = MaterialTheme.colorScheme.error,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
                         }
-                        Spacer(modifier = Modifier.height(24.dp))
-                        PinDotsDisplay(pinLength = confirmPinText.length)
-                        Spacer(modifier = Modifier.height(32.dp))
-                        NumericKeypad(
+                        Spacer(modifier = Modifier.height(14.dp))
+                        CustomNumericKeypad(
+                            doneLabel = "Done",
                             onDigitClick = { digit ->
+                                errorMessage = ""
                                 if (confirmPinText.length < 10) confirmPinText += digit
                             },
                             onBackspaceClick = {
+                                errorMessage = ""
                                 if (confirmPinText.isNotEmpty()) confirmPinText = confirmPinText.dropLast(1)
                             },
+                            onClearAllClick = {
+                                errorMessage = ""
+                                confirmPinText = ""
+                            },
                             onDoneClick = {
-                                if (confirmPinText == firstEnteredPin) {
+                                if (confirmPinText == firstEnteredPin && confirmPinText.isNotEmpty()) {
                                     setupStep = 3
                                     errorMessage = ""
                                 } else {
                                     errorMessage = "PINs do not match. Try again."
+                                    shakeTrigger++
                                     confirmPinText = ""
                                 }
                             }
@@ -323,147 +381,83 @@ fun AuthScreen(
                     }
                 }
             } else {
-                // NORMAL LOCK SCREEN UNLOCK
+                // NORMAL LOCK SCREEN UNLOCK (Point 7: Never auto-submits on digit count)
                 Text(
-                    text = "Local Vault Unlocking",
+                    text = "Local Vault",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Enter your Vault PIN",
+                    text = "Enter your PIN and tap Unlock (✓)",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(24.dp))
-                PinDotsDisplay(pinLength = pinText.length)
-                Spacer(modifier = Modifier.height(32.dp))
-                NumericKeypad(
+                Spacer(modifier = Modifier.height(20.dp))
+
+                AnimatedPinDotsDisplay(
+                    pinLength = pinText.length,
+                    shakeTrigger = shakeTrigger,
+                    isError = errorMessage.isNotEmpty()
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Box(modifier = Modifier.height(22.dp), contentAlignment = Alignment.Center) {
+                    if (errorMessage.isNotEmpty()) {
+                        Text(
+                            text = errorMessage,
+                            color = MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                CustomNumericKeypad(
+                    doneLabel = "Unlock",
                     onDigitClick = { digit ->
+                        if (errorMessage.isNotEmpty()) errorMessage = ""
                         if (pinText.length < 10) pinText += digit
                     },
                     onBackspaceClick = {
+                        if (errorMessage.isNotEmpty()) errorMessage = ""
                         if (pinText.isNotEmpty()) pinText = pinText.dropLast(1)
                     },
+                    onClearAllClick = {
+                        errorMessage = ""
+                        pinText = ""
+                    },
                     onDoneClick = {
-                        if (pinText.isNotEmpty()) {
-                            onPinSubmit(pinText)
-                            pinText = ""
+                        if (pinText.isEmpty()) {
+                            errorMessage = "Incorrect PIN"
+                            shakeTrigger++
+                            return@CustomNumericKeypad
+                        }
+                        val ok = onPinSubmit(pinText)
+                        pinText = ""
+                        if (!ok) {
+                            errorMessage = "Incorrect PIN"
+                            shakeTrigger++
+                        } else {
+                            errorMessage = ""
                         }
                     }
                 )
+
                 Spacer(modifier = Modifier.height(16.dp))
                 TextButton(
-                    onClick = { isRecoveryMode = true },
+                    onClick = {
+                        errorMessage = ""
+                        isRecoveryMode = true
+                    },
                     modifier = Modifier.testTag("forgot_pin_link")
                 ) {
                     Text("Forgot PIN?")
                 }
             }
-        }
-    }
-}
-
-/**
- * Dynamic PIN Dots Indicator:
- * Expands from 6 baseline dots up to 10 dots as the user enters 7–10 digits,
- * with adaptive sizing and spacing so every digit from 1 to 10 provides immediate visual feedback.
- */
-@Composable
-fun PinDotsDisplay(pinLength: Int) {
-    val totalDots = maxOf(6, pinLength).coerceAtMost(10)
-    val dotSize = if (totalDots > 7) 13.dp else 16.dp
-    val dotSpacing = if (totalDots > 7) 8.dp else 12.dp
-
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(dotSpacing),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        repeat(totalDots) { index ->
-            val isFilled = index < pinLength
-            Box(
-                modifier = Modifier
-                    .size(if (isFilled) dotSize else dotSize * 0.85f)
-                    .clip(CircleShape)
-                    .background(
-                        if (isFilled) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.surfaceContainerHigh
-                    )
-            )
-        }
-    }
-}
-
-@Composable
-fun NumericKeypad(
-    onDigitClick: (String) -> Unit,
-    onBackspaceClick: () -> Unit,
-    onDoneClick: () -> Unit
-) {
-    val keys = listOf(
-        listOf("1", "2", "3"),
-        listOf("4", "5", "6"),
-        listOf("7", "8", "9"),
-        listOf("BACK", "0", "DONE")
-    )
-
-    Column(
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        keys.forEach { row ->
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                row.forEach { key ->
-                    KeypadButton(
-                        key = key,
-                        onClick = {
-                            when (key) {
-                                "BACK" -> onBackspaceClick()
-                                "DONE" -> onDoneClick()
-                                else -> onDigitClick(key)
-                            }
-                        }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun KeypadButton(key: String, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .size(72.dp)
-            .clip(CircleShape)
-            .background(
-                if (key == "DONE") MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.surfaceVariant
-            )
-            .clickable { onClick() }
-            .testTag("keypad_$key"),
-        contentAlignment = Alignment.Center
-    ) {
-        when (key) {
-            "BACK" -> Icon(
-                imageVector = Icons.AutoMirrored.Filled.Backspace,
-                contentDescription = "Backspace",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            "DONE" -> Icon(
-                imageVector = Icons.Default.Check,
-                contentDescription = "Done",
-                tint = MaterialTheme.colorScheme.onPrimary
-            )
-            else -> Text(
-                text = key,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }

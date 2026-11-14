@@ -329,6 +329,51 @@ class VaultHeaderManager(private val context: Context) {
         }
     }
 
+    @Synchronized
+    fun verifyDecoyPinOnly(inputPin: String): Boolean {
+        if (!isVaultInitialized()) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            if (!json.optBoolean("hasDecoy", false)) return false
+            val saltDecoy = fromHex(json.getString("saltDecoy"))
+            val slotDecoyEncrypted = fromHex(json.getString("slotDecoy"))
+            val decoyKey = CryptoEngine.deriveKey(inputPin, saltDecoy)
+            CryptoEngine.decryptAesGcm(slotDecoyEncrypted, decoyKey)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    @Synchronized
+    fun verifyActiveVaultPin(inputPin: String, isDecoyMode: Boolean): Boolean {
+        return if (isDecoyMode) {
+            verifyDecoyPinOnly(inputPin)
+        } else {
+            verifyRealPinOnly(inputPin)
+        }
+    }
+
+    @Synchronized
+    fun updateDecoyPinWithCurrentKey(masterKey: SecretKey, newDecoyPin: String): Boolean {
+        if (!isVaultInitialized()) return false
+        if (verifyRealPinOnly(newDecoyPin)) return false
+        return try {
+            val json = JSONObject(headerFile.readText())
+            val saltDecoy = CryptoEngine.generateRandomBytes(16)
+            val decoyPinKey = CryptoEngine.deriveKey(newDecoyPin, saltDecoy)
+            val slotDecoyEncrypted = CryptoEngine.encryptAesGcm(masterKey.encoded, decoyPinKey)
+
+            json.put("hasDecoy", true)
+            json.put("saltDecoy", toHex(saltDecoy))
+            json.put("slotDecoy", toHex(slotDecoyEncrypted))
+            headerFile.writeText(json.toString())
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun createFolderCustomPinPair(customPin: String): Pair<String, String> {
         val salt = CryptoEngine.generateRandomBytes(16)
         val key = CryptoEngine.deriveKey(customPin, salt)
@@ -347,6 +392,28 @@ class VaultHeaderManager(private val context: Context) {
             String(decrypted, Charsets.UTF_8) == "FOLDER_LOCK_VERIFIED"
         } catch (_: Exception) {
             false
+        }
+    }
+
+    /**
+     * Point 8: Context-Aware PIN Verification Rule.
+     * - If `folder != null && folder.hasCustomPin() == true`, verifies `inputPin` against
+     *   that specific folder's custom PIN hash (`folder.customPinSaltHex` / `folder.customPinSlotAHex`).
+     * - Otherwise, verifies `inputPin` against the Main Vault PIN (`verifyActiveVaultPin`).
+     */
+    fun verifyContextualPin(
+        folder: com.example.data.db.FolderItem?,
+        inputPin: String,
+        isDecoyMode: Boolean = false
+    ): Boolean {
+        return if (folder != null && folder.hasCustomPin()) {
+            verifyFolderCustomPin(
+                inputPin = inputPin,
+                saltHex = folder.customPinSaltHex,
+                slotHex = folder.customPinSlotAHex
+            )
+        } else {
+            verifyActiveVaultPin(inputPin, isDecoyMode)
         }
     }
 

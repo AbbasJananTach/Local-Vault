@@ -2,6 +2,7 @@ package com.example.data
 
 import android.content.Context
 import android.os.Environment
+import com.example.ui.home.SortMode
 import com.example.ui.theme.VaultThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,19 +40,31 @@ class VaultPreferences(context: Context) {
     val bruteForceLockoutEnabled: StateFlow<Boolean> = _bruteForceLockoutEnabled.asStateFlow()
 
     /**
-     * Privacy & Security Hardening:
-     * Enabled by default (`true`) to apply `WindowManager.LayoutParams.FLAG_SECURE`,
-     * preventing screenshots, screen recording, and Recent Apps thumbnail leakage.
+     * Screenshots are blocked for user privacy by default.
      */
     private val _blockScreenshots = MutableStateFlow(
         prefs.getBoolean(KEY_BLOCK_SCREENSHOTS, true)
     )
     val blockScreenshots: StateFlow<Boolean> = _blockScreenshots.asStateFlow()
 
+    /**
+     * Point 16: Strictly 3 Thumbnail Grid Size Levels:
+     * - Large = 2 columns
+     * - Medium = 3 columns
+     * - Small = 4 columns
+     */
     private val _defaultGridColumns = MutableStateFlow(
-        prefs.getInt(KEY_DEFAULT_GRID_COLUMNS, 3).coerceIn(2, 5)
+        prefs.getInt(KEY_DEFAULT_GRID_COLUMNS, 3).coerceIn(2, 4)
     )
     val defaultGridColumns: StateFlow<Int> = _defaultGridColumns.asStateFlow()
+
+    /**
+     * Point 16: Persistent Sort Order saved in SharedPreferences across app restarts.
+     */
+    private val _sortMode = MutableStateFlow(
+        SortMode.fromName(prefs.getString(KEY_SORT_MODE, SortMode.NEWEST.name))
+    )
+    val sortMode: StateFlow<SortMode> = _sortMode.asStateFlow()
 
     private val _showFileNamesOnGrid = MutableStateFlow(
         prefs.getBoolean(KEY_SHOW_FILE_NAMES, true)
@@ -89,9 +102,14 @@ class VaultPreferences(context: Context) {
     }
 
     fun setDefaultGridColumns(columns: Int) {
-        val valid = columns.coerceIn(2, 5)
+        val valid = columns.coerceIn(2, 4)
         prefs.edit().putInt(KEY_DEFAULT_GRID_COLUMNS, valid).apply()
         _defaultGridColumns.value = valid
+    }
+
+    fun setSortMode(mode: SortMode) {
+        prefs.edit().putString(KEY_SORT_MODE, mode.name).apply()
+        _sortMode.value = mode
     }
 
     fun setShowFileNamesOnGrid(show: Boolean) {
@@ -130,6 +148,7 @@ class VaultPreferences(context: Context) {
         private const val KEY_BRUTE_FORCE_LOCKOUT = "brute_force_lockout"
         private const val KEY_BLOCK_SCREENSHOTS = "block_screenshots"
         private const val KEY_DEFAULT_GRID_COLUMNS = "default_grid_columns"
+        private const val KEY_SORT_MODE = "sort_mode"
         private const val KEY_SHOW_FILE_NAMES = "show_file_names"
         private const val KEY_AUTO_HIDE_ENABLED = "auto_hide_enabled"
         private const val KEY_WATCHED_FOLDERS = "watched_folders"

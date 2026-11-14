@@ -13,15 +13,15 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 
 /**
- * Architectural Streaming Decryption Fix:
- * Instead of maintaining a stateful `Cipher` across arbitrary `read()` calls using `cipher.update()`
- * (which can buffer partial 16-byte blocks or desynchronize during ExoPlayer's rapid tail-end `moov`
- * atom probing), `EncryptedFileDataSource` performs deterministic, stateless AES-256-CTR block
- * decryption on every `read()` call:
- * 1. Computes the 16-byte aligned `blockStart = (currentPosition / 16L) * 16L` and `intraBlockOffset`.
- * 2. Calculates the exact 128-bit counter IV for `blockStart` via `CryptoEngine.calculateCtrIvForOffset`.
- * 3. Decrypts the aligned slice via `cipher.doFinal` and copies the exact requested byte range into `buffer`.
- * 4. Advances `currentPosition += toCopy` for 100% bit-accurate sequential and random-access reads.
+ * Point 22: Universal Random-Access Streaming Decryption DataSource for Media3 / ExoPlayer.
+ * - Supports arbitrary byte-range seeking (`open(DataSpec)` with exact `dataSpec.position` offset
+ *   calculation and `read(buffer, offset, length)`).
+ * - Performs deterministic, stateless AES-256-CTR 16-byte block alignment on every read:
+ *   1. Computes `blockStart = (currentPosition / 16L) * 16L` and `intraBlockOffset = (currentPosition % 16L).toInt()`.
+ *   2. Computes the exact 128-bit counter IV for `blockStart` via `CryptoEngine.calculateCtrIvForOffset`.
+ *   3. Reuses a pre-allocated `Cipher` instance (`AES/CTR/NoPadding`) initialized with the block's IV
+ *      so 4K/60fps playback and rapid scrubbing have zero JCE provider lookup overhead.
+ *   4. Gracefully handles `dataSpec.position == fileLength` probes used by MP4/MKV/MOV extractors.
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class EncryptedFileDataSource(
@@ -35,13 +35,14 @@ class EncryptedFileDataSource(
     private var currentPosition: Long = 0L
     private var bytesRemaining: Long = 0L
     private var isOpen = false
+    private val cipher: Cipher = Cipher.getInstance("AES/CTR/NoPadding")
 
     override fun open(dataSpec: DataSpec): Long {
         uri = dataSpec.uri
         transferInitializing(dataSpec)
 
         if (!blobFile.exists()) {
-            throw EOFException("Encrypted media blob not found")
+            throw EOFException("Encrypted media blob not found: ${blobFile.name}")
         }
 
         val raf = RandomAccessFile(blobFile, "r")
@@ -49,7 +50,11 @@ class EncryptedFileDataSource(
         val fileLength = raf.length()
 
         if (dataSpec.position > fileLength) {
-            throw EOFException("Seek position ${dataSpec.position} exceeds file length $fileLength")
+            bytesRemaining = 0L
+            currentPosition = fileLength
+            isOpen = true
+            transferStarted(dataSpec)
+            return 0L
         }
 
         currentPosition = dataSpec.position
@@ -89,7 +94,6 @@ class EncryptedFileDataSource(
         }
 
         val adjustedIv = CryptoEngine.calculateCtrIvForOffset(baseIv, blockStart)
-        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(adjustedIv))
         val decrypted = cipher.doFinal(encryptedBuffer, 0, totalReadFromDisk)
 

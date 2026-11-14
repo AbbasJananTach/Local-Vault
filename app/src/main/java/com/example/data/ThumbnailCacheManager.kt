@@ -1,9 +1,13 @@
 package com.example.data
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Build
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -12,8 +16,10 @@ import com.example.data.db.VaultItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
@@ -21,13 +27,20 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 
 /**
- * Architectural Memory Fix:
- * Replaces full-file `ByteArrayOutputStream` RAM buffering with two-pass streaming `CipherInputStream`
- * decoding (`inJustDecodeBounds = true` header pass followed by sampled `BitmapFactory.decodeStream`).
- * This prevents `OutOfMemoryError` when generating grid thumbnails or viewing 50MP+ photos.
+ * Architectural All-Format Thumbnail & Photo Decoder (Point 2):
+ * 1. Safe Thumbnail Generation on Import:
+ *    Generates a downsampled thumbnail inside an isolated `try-catch` block using `ImageDecoder`
+ *    (API 28+, which natively supports HEIC, HEIF, WEBP, BMP, GIF, PNG, JPEG) or downsampled
+ *    `BitmapFactory.Options` (`inSampleSize`), encrypting the thumbnail into `.LocalVaultData/thumbs/`.
+ *    Even if thumbnail generation fails on an exotic format, it NEVER aborts the file import.
+ * 2. Two-Pass Streaming & Temp-File `ImageDecoder` Fallback for Full Photo Viewer:
+ *    Decodes standard formats via two-pass `CipherInputStream`, and if `BitmapFactory` returns null
+ *    for an encrypted HEIC/HEIF container on certain OEM ROMs, streams to an ephemeral cache file,
+ *    decodes via `ImageDecoder`, and immediately wipes the cache file.
  */
 object ThumbnailCacheManager {
-    private const val MAX_CACHE_ENTRIES = 160
+    private const val MAX_CACHE_ENTRIES = 180
+    private const val THUMB_TARGET_SIZE = 320
 
     private val memoryCache = object : LruCache<Long, ImageBitmap>(MAX_CACHE_ENTRIES) {
         override fun sizeOf(key: Long, value: ImageBitmap): Int = 1
@@ -45,6 +58,150 @@ object ThumbnailCacheManager {
         memoryCache.size()
     }
 
+    /**
+     * Generates and encrypts a 320px thumbnail during import inside an isolated `try-catch` block.
+     * Never throws or aborts the caller's import operation.
+     */
+    fun generateAndSaveSafeThumbnailDuringImport(
+        context: Context,
+        sourceUri: Uri,
+        resolvedFsPath: String,
+        mimeType: String,
+        thumbFile: File,
+        masterKey: SecretKey
+    ) {
+        try {
+            val bitmap: Bitmap? = if (mimeType.startsWith("video")) {
+                decodeSourceVideoThumbnail(context, sourceUri, resolvedFsPath)
+            } else {
+                decodeSourceImageThumbnail(context, sourceUri, resolvedFsPath)
+            }
+            if (bitmap != null) {
+                saveEncryptedThumbFile(bitmap, thumbFile, masterKey)
+            }
+        } catch (_: Throwable) {
+            // Never abort import even if thumbnail generation fails
+        }
+    }
+
+    private fun decodeSourceImageThumbnail(
+        context: Context,
+        sourceUri: Uri,
+        resolvedFsPath: String
+    ): Bitmap? {
+        // Prefer ImageDecoder on Android 9+ (API 28+) as it natively decodes HEIC, HEIF, WEBP, PNG, BMP, GIF, JPG
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val source = if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                    ImageDecoder.createSource(File(resolvedFsPath))
+                } else {
+                    ImageDecoder.createSource(context.contentResolver, sourceUri)
+                }
+                return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val w = info.size.width
+                    val h = info.size.height
+                    if (w > 0 && h > 0) {
+                        var sample = 1
+                        while (w / (sample * 2) >= THUMB_TARGET_SIZE && h / (sample * 2) >= THUMB_TARGET_SIZE) {
+                            sample *= 2
+                        }
+                        decoder.setTargetSampleSize(sample)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        // Fallback to two-pass BitmapFactory with inSampleSize
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                BitmapFactory.decodeFile(resolvedFsPath, bounds)
+            } else {
+                context.contentResolver.openInputStream(sourceUri)?.use {
+                    BitmapFactory.decodeStream(it, null, bounds)
+                }
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+            var sampleSize = 1
+            while (bounds.outWidth / (sampleSize * 2) >= THUMB_TARGET_SIZE &&
+                bounds.outHeight / (sampleSize * 2) >= THUMB_TARGET_SIZE
+            ) {
+                sampleSize *= 2
+            }
+
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                BitmapFactory.decodeFile(resolvedFsPath, opts)
+            } else {
+                context.contentResolver.openInputStream(sourceUri)?.use {
+                    BitmapFactory.decodeStream(it, null, opts)
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun decodeSourceVideoThumbnail(
+        context: Context,
+        sourceUri: Uri,
+        resolvedFsPath: String
+    ): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                retriever.setDataSource(resolvedFsPath)
+            } else {
+                retriever.setDataSource(context, sourceUri)
+            }
+            val rawFrame = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.frameAtTime
+            if (rawFrame != null) {
+                val maxDim = THUMB_TARGET_SIZE.toFloat()
+                val ratio = minOf(maxDim / rawFrame.width, maxDim / rawFrame.height, 1f)
+                val w = (rawFrame.width * ratio).toInt().coerceAtLeast(1)
+                val h = (rawFrame.height * ratio).toInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(rawFrame, w, h, true)
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun saveEncryptedThumbFile(bitmap: Bitmap, thumbFile: File, masterKey: SecretKey) {
+        try {
+            thumbFile.parentFile?.mkdirs()
+            val baos = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 82, baos)
+            val encrypted = CryptoEngine.encryptAesGcm(baos.toByteArray(), masterKey)
+            thumbFile.writeBytes(encrypted)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun loadEncryptedThumbFile(thumbFile: File, masterKey: SecretKey): Bitmap? {
+        if (!thumbFile.exists() || thumbFile.length() == 0L) return null
+        return try {
+            val decrypted = CryptoEngine.decryptAesGcm(thumbFile.readBytes(), masterKey)
+            BitmapFactory.decodeByteArray(decrypted, 0, decrypted.size)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     suspend fun loadThumbnail(
         item: VaultItem,
         blobFile: File,
@@ -53,15 +210,27 @@ object ThumbnailCacheManager {
         getCached(item.id)?.let { return@withContext it }
         if (!blobFile.exists() || blobFile.length() == 0L) return@withContext null
 
-        val baseIv = fromHex(item.baseIvHex)
-        val bitmap: Bitmap? = try {
-            if (item.mimeType.startsWith("video")) {
-                decodeEncryptedVideoThumbnail(blobFile, masterKey, baseIv)
-            } else {
-                decodeEncryptedImageThumbnail(blobFile, masterKey, baseIv)
+        val thumbsDir = File(blobFile.parentFile?.parentFile ?: blobFile.parentFile, "thumbs")
+        val thumbFile = File(thumbsDir, "${item.encryptedRelativePath}.thumb")
+
+        // 1. Check pre-generated encrypted disk thumbnail first
+        var bitmap: Bitmap? = loadEncryptedThumbFile(thumbFile, masterKey)
+
+        // 2. If not cached on disk, decode from the encrypted blob and persist to thumbsDir
+        if (bitmap == null) {
+            val baseIv = fromHex(item.baseIvHex)
+            bitmap = try {
+                if (item.mimeType.startsWith("video")) {
+                    decodeEncryptedVideoThumbnail(blobFile, masterKey, baseIv)
+                } else {
+                    decodeEncryptedImageThumbnail(blobFile, masterKey, baseIv)
+                }
+            } catch (_: Throwable) {
+                null
             }
-        } catch (_: Exception) {
-            null
+            if (bitmap != null) {
+                saveEncryptedThumbFile(bitmap, thumbFile, masterKey)
+            }
         }
 
         if (bitmap != null) {
@@ -74,12 +243,6 @@ object ThumbnailCacheManager {
         return@withContext null
     }
 
-    /**
-     * Streams the encrypted image through `CipherInputStream` in two passes:
-     * Pass 1 reads only the image header to determine dimensions (`inJustDecodeBounds = true`).
-     * Pass 2 decodes a downsampled `RGB_565` bitmap directly from the stream without holding the
-     * full decrypted file in heap memory.
-     */
     private fun decodeEncryptedImageThumbnail(
         blobFile: File,
         masterKey: SecretKey,
@@ -93,31 +256,32 @@ object ThumbnailCacheManager {
             BitmapFactory.decodeStream(stream, null, boundsOptions)
         }
 
-        if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return null
+        if (boundsOptions.outWidth > 0 && boundsOptions.outHeight > 0) {
+            var sampleSize = 1
+            while (boundsOptions.outWidth / (sampleSize * 2) >= THUMB_TARGET_SIZE &&
+                boundsOptions.outHeight / (sampleSize * 2) >= THUMB_TARGET_SIZE
+            ) {
+                sampleSize *= 2
+            }
 
-        val targetSize = 320
-        var sampleSize = 1
-        while (boundsOptions.outWidth / (sampleSize * 2) >= targetSize &&
-            boundsOptions.outHeight / (sampleSize * 2) >= targetSize
-        ) {
-            sampleSize *= 2
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+
+            val decoded = createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            }
+            if (decoded != null) return decoded
         }
 
-        val decodeOptions = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-            inPreferredConfig = Bitmap.Config.RGB_565
+        // Fallback for HEIC/HEIF streams that require seekable file source via ImageDecoder (API 28+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            return decodeViaTempImageDecoder(blobFile, masterKey, baseIv, THUMB_TARGET_SIZE)
         }
-
-        return createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
-            BitmapFactory.decodeStream(stream, null, decodeOptions)
-        }
+        return null
     }
 
-    /**
-     * Decodes a high-resolution photo asynchronously on `Dispatchers.IO` using two-pass streaming
-     * `CipherInputStream` with a safe maximum dimension cap (`maxDimension = 2560`) so high-res
-     * camera photos render crisply without freezing the UI or exhausting RAM.
-     */
     suspend fun decodeFullPhotoAsync(
         blobFile: File,
         masterKey: SecretKey,
@@ -133,25 +297,73 @@ object ThumbnailCacheManager {
                 BitmapFactory.decodeStream(stream, null, boundsOptions)
             }
 
-            if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return@withContext null
+            if (boundsOptions.outWidth > 0 && boundsOptions.outHeight > 0) {
+                var sampleSize = 1
+                while (boundsOptions.outWidth / sampleSize > maxDimension ||
+                    boundsOptions.outHeight / sampleSize > maxDimension
+                ) {
+                    sampleSize *= 2
+                }
 
-            var sampleSize = 1
-            while (boundsOptions.outWidth / sampleSize > maxDimension ||
-                boundsOptions.outHeight / sampleSize > maxDimension
-            ) {
-                sampleSize *= 2
+                val decodeOptions = BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+
+                val decoded = createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
+                    BitmapFactory.decodeStream(stream, null, decodeOptions)
+                }
+                if (decoded != null) return@withContext decoded
             }
 
-            val decodeOptions = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                return@withContext decodeViaTempImageDecoder(blobFile, masterKey, baseIv, maxDimension)
             }
-
-            createDecryptStream(blobFile, masterKey, baseIv).use { stream ->
-                BitmapFactory.decodeStream(stream, null, decodeOptions)
-            }
-        } catch (_: Exception) {
             null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun decodeViaTempImageDecoder(
+        blobFile: File,
+        masterKey: SecretKey,
+        baseIv: ByteArray,
+        targetMaxDim: Int
+    ): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        val tempFile = File(blobFile.parentFile, ".tmp_dec_${System.nanoTime()}")
+        return try {
+            createDecryptStream(blobFile, masterKey, baseIv).use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    val buf = ByteArray(65536)
+                    var r: Int
+                    while (input.read(buf).also { r = it } != -1) {
+                        output.write(buf, 0, r)
+                    }
+                    output.flush()
+                }
+            }
+            val source = ImageDecoder.createSource(tempFile)
+            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val w = info.size.width
+                val h = info.size.height
+                if (w > 0 && h > 0) {
+                    var sample = 1
+                    while (w / sample > targetMaxDim || h / sample > targetMaxDim) {
+                        sample *= 2
+                    }
+                    decoder.setTargetSampleSize(sample)
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try {
+                if (tempFile.exists()) tempFile.delete()
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -162,7 +374,7 @@ object ThumbnailCacheManager {
     ): BufferedInputStream {
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(baseIv))
-        return BufferedInputStream(CipherInputStream(FileInputStream(blobFile), cipher), 16384)
+        return BufferedInputStream(CipherInputStream(FileInputStream(blobFile), cipher), 65536)
     }
 
     private fun decodeEncryptedVideoThumbnail(
@@ -216,7 +428,7 @@ object ThumbnailCacheManager {
             val rawFrame = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 ?: retriever.frameAtTime
             if (rawFrame != null) {
-                val maxDim = 320f
+                val maxDim = THUMB_TARGET_SIZE.toFloat()
                 val ratio = minOf(maxDim / rawFrame.width, maxDim / rawFrame.height, 1f)
                 val w = (rawFrame.width * ratio).toInt().coerceAtLeast(1)
                 val h = (rawFrame.height * ratio).toInt().coerceAtLeast(1)
@@ -224,16 +436,16 @@ object ThumbnailCacheManager {
             } else {
                 null
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         } finally {
             try {
                 retriever.release()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
             try {
                 dataSource.close()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
     }
