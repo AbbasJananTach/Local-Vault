@@ -1,6 +1,9 @@
 package com.example.ui.settings
 
+import android.content.Context
+import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -74,6 +77,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -129,6 +133,7 @@ fun SettingsScreen(
     onToggleWatchedFolder: (String) -> Unit,
     onAddCustomWatchedFolder: (String) -> Unit,
     onSweepWatchedFoldersNow: () -> Unit = {},
+    onRequestBatteryOptimizationExemption: () -> Unit = {},
     // Backup & Storage
     onCreateBackup: () -> Unit,
     onRestoreBackup: () -> Unit,
@@ -138,6 +143,18 @@ fun SettingsScreen(
     usedVaultBytes: Long
 ) {
     BackHandler { onBack() }
+
+    val context = LocalContext.current
+    val powerManager = remember(context) {
+        context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    }
+    val isBatteryUnrestricted = remember(context, isAutoHideEnabled) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && powerManager != null) {
+            powerManager.isIgnoringBatteryOptimizations(context.packageName)
+        } else {
+            true
+        }
+    }
 
     var showVerifyCurrentPinForChange by remember { mutableStateOf(false) }
     var verifiedOldPinForChange by remember { mutableStateOf<String?>(null) }
@@ -625,6 +642,21 @@ fun SettingsScreen(
                                 }
                             }
                         }
+
+                        if (!isBatteryUnrestricted) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = onRequestBatteryOptimizationExemption,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("battery_optimization_button")
+                            ) {
+                                Text(
+                                    text = "Allow Unrestricted Battery (Recommended for 24/7 Auto-Hide)",
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -734,7 +766,7 @@ fun SettingsScreen(
         val oldPin = verifiedOldPinForChange!!
         CustomPinSetupDialog(
             title = "New Vault PIN",
-            step1Subtitle = "Enter a new 1 to 10 digit PIN, then tap Done (✓)",
+            step1Subtitle = "Enter a new 4 to 10 digit PIN, then tap Done (✓)",
             step2Subtitle = "Re-enter the new PIN to confirm, then tap Done (✓)",
             onPinConfirmed = { newPin ->
                 val ok = onChangeMasterPin(oldPin, newPin)
@@ -799,7 +831,7 @@ fun SettingsScreen(
     if (showFakePinDialog && !isDecoyMode) {
         CustomPinSetupDialog(
             title = "Decoy PIN",
-            step1Subtitle = "Enter a 1 to 10 digit Decoy PIN (different from your Master PIN), then tap Done (✓)",
+            step1Subtitle = "Enter a 4 to 10 digit Decoy PIN (different from your Master PIN), then tap Done (✓)",
             step2Subtitle = "Re-enter the Decoy PIN to confirm, then tap Done (✓)",
             onPinConfirmed = { fakePin ->
                 val ok = onSetupFakePin(fakePin)

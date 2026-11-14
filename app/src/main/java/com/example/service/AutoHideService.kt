@@ -46,12 +46,16 @@ class AutoHideService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundServiceNotification()
-        val watchedPaths = intent?.getStringArrayExtra("WATCHED_PATHS") ?: emptyArray()
+        val prefs = com.example.data.VaultPreferences(this)
+        val watchedPaths = intent?.getStringArrayExtra("WATCHED_PATHS")
+            ?: prefs.watchedFolders.value.toTypedArray()
         val targetFolderId = intent?.getLongExtra("TARGET_FOLDER_ID", -1L)?.let { if (it == -1L) null else it }
         val isDecoy = intent?.getBooleanExtra("IS_DECOY", false) ?: false
         val keyBytes = intent?.getByteArrayExtra("MASTER_KEY_BYTES")
         if (keyBytes != null && keyBytes.size == 32) {
             activeMasterKey = SecretKeySpec(keyBytes, "AES")
+        } else if (activeMasterKey == null) {
+            activeMasterKey = com.example.crypto.AutoHideKeyStoreHelper.unsealMasterKeyForAutoHide(this)
         }
 
         setupFileObservers(watchedPaths, targetFolderId, isDecoy)

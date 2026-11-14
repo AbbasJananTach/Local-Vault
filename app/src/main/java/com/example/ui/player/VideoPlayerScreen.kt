@@ -7,7 +7,6 @@ import android.media.AudioManager
 import android.net.Uri
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
-import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -50,6 +49,8 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.VolumeUp
@@ -119,6 +120,7 @@ import com.example.data.VaultRepository
 import com.example.data.db.FolderItem
 import com.example.data.db.VaultItem
 import com.example.ui.components.CustomPinKeypadDialog
+import com.example.ui.util.findActivity
 import kotlinx.coroutines.delay
 import java.io.File
 import java.util.Locale
@@ -153,7 +155,7 @@ fun VideoPlayerScreen(
     val context = LocalContext.current
     val currentView = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val activity = context as? Activity
+    val activity = remember(context) { context.findActivity() }
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
 
     // Supports switching videos inside the player via the "More Videos" YouTube-style thumbnail drawer (Point 26)
@@ -224,36 +226,40 @@ fun VideoPlayerScreen(
         registerInteraction()
         val nextLandscape = !isLandscapeMode
         isLandscapeMode = nextLandscape
-        activity?.requestedOrientation = if (nextLandscape) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        try {
+            activity?.requestedOrientation = if (nextLandscape) {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+        } catch (_: Throwable) {
         }
         hudIcon = Icons.Default.ScreenRotation
         hudText = if (nextLandscape) "Landscape" else "Portrait"
     }
 
-    // Point 21 (Layer 3) & Point 22: Universal ExoPlayer with DefaultRenderersFactory decoder fallback,
+    // Point 21 (Layer 3) & Point 22 & Hotfix #1: Defensive ExoPlayer with DefaultRenderersFactory decoder fallback,
     // C.WAKE_MODE_LOCAL, and DefaultExtractorsFactory constant-bitrate seeking.
     val exoPlayer = remember {
         val renderersFactory = DefaultRenderersFactory(context)
             .setEnableDecoderFallback(true)
 
         ExoPlayer.Builder(context, renderersFactory).build().apply {
-            // Point 21 (Layer 3): ExoPlayer local wake mode
             setWakeMode(C.WAKE_MODE_LOCAL)
             playWhenReady = true
             addListener(object : Player.Listener {
-                // Point 27 (Step 1): Keep existing automatic video orientation / sizing 100% untouched!
                 override fun onVideoSizeChanged(videoSize: VideoSize) {
                     if (videoSize.width > 0 && videoSize.height > 0) {
                         videoResolutionLabel = "${videoSize.width}×${videoSize.height}"
                         val shouldBeLandscape = videoSize.width > videoSize.height
                         isLandscapeMode = shouldBeLandscape
-                        activity?.requestedOrientation = if (shouldBeLandscape) {
-                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                        } else {
-                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        try {
+                            activity?.requestedOrientation = if (shouldBeLandscape) {
+                                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                            } else {
+                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            }
+                        } catch (_: Throwable) {
                         }
                     }
                 }
@@ -276,46 +282,51 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Point 22: Load or switch the decrypted streaming MediaSource whenever activeVideoItem changes.
-    // Sanitizes filenames so extra text after .mp4 or unusual extensions never break MIME detection.
+    // Hotfix #1: Defensively load/switch decrypted streaming MediaSource inside try-catch
     LaunchedEffect(activeVideoItem.id, activeBlobFile, activeBaseIv) {
         playerError = null
         currentPosition = 0L
         duration = activeVideoItem.durationMs.coerceAtLeast(0L)
 
-        val dataSourceFactory = DataSource.Factory {
-            EncryptedFileDataSource(activeBlobFile, masterKey, activeBaseIv)
+        try {
+            val dataSourceFactory = DataSource.Factory {
+                EncryptedFileDataSource(activeBlobFile, masterKey, activeBaseIv)
+            }
+            val extractorsFactory = DefaultExtractorsFactory()
+                .setConstantBitrateSeekingEnabled(true)
+                .setConstantBitrateSeekingAlwaysEnabled(true)
+
+            val sanitizedExt = extractSanitizedVideoExtension(activeVideoItem.fileName, activeVideoItem.mimeType)
+            val streamUri = Uri.parse("vault://video/${activeVideoItem.id}.$sanitizedExt")
+
+            val mediaItem = MediaItem.Builder()
+                .setUri(streamUri)
+                .build()
+
+            val mediaSource = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
+                .createMediaSource(mediaItem)
+
+            exoPlayer.setMediaSource(mediaSource)
+            exoPlayer.setPlaybackSpeed(playbackSpeed)
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+            isPlaying = true
+            areControlsVisible = true
+            lastInteractionTime = System.currentTimeMillis()
+        } catch (t: Throwable) {
+            playerError = t.localizedMessage ?: "Unable to initialize video player"
+            isPlaying = false
         }
-        val extractorsFactory = DefaultExtractorsFactory()
-            .setConstantBitrateSeekingEnabled(true)
-            .setConstantBitrateSeekingAlwaysEnabled(true)
-
-        val sanitizedExt = extractSanitizedVideoExtension(activeVideoItem.fileName, activeVideoItem.mimeType)
-        val streamUri = Uri.parse("vault://video/${activeVideoItem.id}.$sanitizedExt")
-
-        val mediaItem = MediaItem.Builder()
-            .setUri(streamUri)
-            .build()
-
-        val mediaSource = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
-            .createMediaSource(mediaItem)
-
-        exoPlayer.setMediaSource(mediaSource)
-        exoPlayer.setPlaybackSpeed(playbackSpeed)
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = true
-        isPlaying = true
-        areControlsVisible = true
-        lastInteractionTime = System.currentTimeMillis()
     }
 
-    // Point 21 (Layer 1 & Layer 2) & Point 27 (Step 4):
-    // - Layer 1: WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-    // - Layer 2: LocalView.current.keepScreenOn = true
-    // - Point 27 (Step 4): Restore normal screen brightness (BRIGHTNESS_OVERRIDE_NONE) in onDispose!
+    // Point 21 & Hotfix #1: Keep screen awake during playback + restore orientation/brightness safely on dispose.
+    // Ignores transient config-change lifecycle pauses while rotating so playback & vault session never reset!
     DisposableEffect(lifecycleOwner, exoPlayer, currentView) {
         VaultRepository.registerActivePlayer(exoPlayer)
-        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } catch (_: Throwable) {
+        }
         currentView.keepScreenOn = true
 
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
@@ -331,8 +342,11 @@ fun VideoPlayerScreen(
                     } catch (_: Throwable) {
                     }
                     VaultRepository.stopAndReleaseActivePlayerAndClearSession()
-                    activity?.finishAffinity()
-                    activity?.finishAndRemoveTask()
+                    try {
+                        activity?.finishAffinity()
+                        activity?.finishAndRemoveTask()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }
@@ -345,6 +359,9 @@ fun VideoPlayerScreen(
         }
 
         val observer = LifecycleEventObserver { _, event ->
+            if (activity?.isChangingConfigurations == true) {
+                return@LifecycleEventObserver
+            }
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
                 val isScreenOff = powerManager != null && !powerManager.isInteractive
                 if (isScreenOff) {
@@ -357,8 +374,11 @@ fun VideoPlayerScreen(
                     } catch (_: Throwable) {
                     }
                     VaultRepository.stopAndReleaseActivePlayerAndClearSession()
-                    activity?.finishAffinity()
-                    activity?.finishAndRemoveTask()
+                    try {
+                        activity?.finishAffinity()
+                        activity?.finishAndRemoveTask()
+                    } catch (_: Throwable) {
+                    }
                 } else {
                     try {
                         exoPlayer.pause()
@@ -377,18 +397,25 @@ fun VideoPlayerScreen(
             }
             VaultRepository.unregisterActivePlayer(exoPlayer)
 
-            // Point 21: Clear keep-screen-on flags only when leaving the video player
             currentView.keepScreenOn = false
-            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-            // Point 27 (Step 4): Always restore normal screen brightness upon exiting video player
-            val params = activity?.window?.attributes
-            if (params != null) {
-                params.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                activity.window.attributes = params
+            try {
+                activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } catch (_: Throwable) {
             }
 
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            try {
+                val params = activity?.window?.attributes
+                if (params != null) {
+                    params.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                    activity.window.attributes = params
+                }
+            } catch (_: Throwable) {
+            }
+
+            try {
+                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            } catch (_: Throwable) {
+            }
             lifecycleOwner.lifecycle.removeObserver(observer)
             try {
                 exoPlayer.stop()
@@ -838,10 +865,10 @@ fun VideoPlayerScreen(
                 }
             }
 
-            // Point 23, Point 25 & Point 26:
-            // Auto-Hiding 100% Transparent Bottom Controls with:
-            // - Compact Time & "More Videos" Thumbnail Drawer Button
-            // - YouTube-Style Ultra-Thin (2.5.dp) Progress Slider at the very bottom edge
+            // Hotfix #5: Bottom Auto-Hiding Control Layout:
+            // - Row 1 (Upper Row): Compact time text + speed pill, followed by full-width YouTube-style thin Slider
+            // - Row 2 (Lower Row — Directly BELOW Slider): Previous Video, Play/Pause, Next Video on left,
+            //   and "More Videos" button in the right corner.
             AnimatedVisibility(
                 visible = areControlsVisible,
                 enter = fadeIn(),
@@ -850,144 +877,59 @@ fun VideoPlayerScreen(
             ) {
                 val activePos = if (isScrubbing) scrubPosition else currentPosition
                 val sliderInteractionSource = remember { MutableInteractionSource() }
+                val currentVideoIndex = remember(activeVideoItem.id, playlistVideos) {
+                    playlistVideos.indexOfFirst { it.id == activeVideoItem.id }
+                }
+                val hasPrevVideo = currentVideoIndex > 0
+                val hasNextVideo = currentVideoIndex >= 0 && currentVideoIndex < playlistVideos.lastIndex
 
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color.Transparent)
                         .navigationBarsPadding()
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
-                    // Compact row right above the thin slider: Play/Pause + Timestamp on left, Speed + "More Videos" on right
+                    // ROW 1 (UPPER ROW): Timestamp & Speed badge + Ultra-Thin Full-Width Progress Slider on top
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 4.dp),
+                            .padding(horizontal = 6.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(
-                                onClick = {
-                                    registerInteraction()
-                                    if (exoPlayer.isPlaying) {
-                                        exoPlayer.pause()
-                                        isPlaying = false
-                                    } else {
-                                        if (exoPlayer.playbackState == Player.STATE_ENDED) {
-                                            exoPlayer.seekTo(0L)
-                                        }
-                                        exoPlayer.play()
-                                        isPlaying = true
-                                    }
-                                },
-                                modifier = Modifier
-                                    .size(34.dp)
-                                    .testTag("player_play_pause")
-                            ) {
-                                Icon(
-                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = if (isPlaying) "Pause" else "Play",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.width(6.dp))
-
-                            Text(
-                                text = "${formatTime(activePos)} / ${formatTime(duration)}",
-                                color = Color.White,
-                                style = TextStyle(
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    shadow = overlayTextShadow
-                                )
+                        Text(
+                            text = "${formatTime(activePos)} / ${formatTime(duration)}",
+                            color = Color.White,
+                            style = TextStyle(
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                shadow = overlayTextShadow
                             )
-                        }
+                        )
 
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            // Playback Speed selector
-                            Box {
-                                Row(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable {
-                                            registerInteraction()
-                                            showSpeedMenu = true
-                                        }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                        .testTag("player_speed_btn"),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.Speed,
-                                        contentDescription = "Speed",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "${playbackSpeed}x",
-                                        color = Color.White,
-                                        style = TextStyle(
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            shadow = overlayTextShadow
-                                        )
-                                    )
-                                }
-
-                                DropdownMenu(
-                                    expanded = showSpeedMenu,
-                                    onDismissRequest = {
-                                        showSpeedMenu = false
-                                        registerInteraction()
-                                    }
-                                ) {
-                                    listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { speed ->
-                                        DropdownMenuItem(
-                                            text = {
-                                                Text(
-                                                    "${speed}x",
-                                                    fontWeight = if (playbackSpeed == speed) FontWeight.Bold else FontWeight.Normal
-                                                )
-                                            },
-                                            onClick = {
-                                                registerInteraction()
-                                                playbackSpeed = speed
-                                                exoPlayer.setPlaybackSpeed(speed)
-                                                showSpeedMenu = false
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-
-                            // Point 26 (Step 2): "More Videos" Button (replaces bottom Fit button)
+                        // Playback Speed selector
+                        Box {
                             Row(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(12.dp))
                                     .clickable {
                                         registerInteraction()
-                                        showMoreVideosSheet = true
+                                        showSpeedMenu = true
                                     }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                                    .testTag("player_more_videos_button"),
+                                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                                    .testTag("player_speed_btn"),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    Icons.Default.VideoLibrary,
-                                    contentDescription = "More Videos",
+                                    Icons.Default.Speed,
+                                    contentDescription = "Speed",
                                     tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(14.dp)
                                 )
-                                Spacer(modifier = Modifier.width(5.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = "More Videos",
+                                    text = "${playbackSpeed}x",
                                     color = Color.White,
                                     style = TextStyle(
                                         fontSize = 12.sp,
@@ -996,10 +938,35 @@ fun VideoPlayerScreen(
                                     )
                                 )
                             }
+
+                            DropdownMenu(
+                                expanded = showSpeedMenu,
+                                onDismissRequest = {
+                                    showSpeedMenu = false
+                                    registerInteraction()
+                                }
+                            ) {
+                                listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { speed ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "${speed}x",
+                                                fontWeight = if (playbackSpeed == speed) FontWeight.Bold else FontWeight.Normal
+                                            )
+                                        },
+                                        onClick = {
+                                            registerInteraction()
+                                            playbackSpeed = speed
+                                            exoPlayer.setPlaybackSpeed(speed)
+                                            showSpeedMenu = false
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
 
-                    // Point 26 (Step 1): YouTube-Style Ultra-Thin (2.5.dp) Bottom Slider
+                    // Full-Width Ultra-Thin (2.5.dp) YouTube-Style Progress Slider
                     Slider(
                         value = activePos.toFloat().coerceIn(0f, maxOf(1f, duration.toFloat())),
                         onValueChange = { pos ->
@@ -1039,6 +1006,119 @@ fun VideoPlayerScreen(
                             .height(22.dp)
                             .testTag("player_thin_slider")
                     )
+
+                    // ROW 2 (LOWER ROW — DIRECTLY BELOW SLIDER):
+                    // Left: Previous Video, Play/Pause, Next Video
+                    // Right: "More Videos" Thumbnail Drawer Button
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 2.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    if (hasPrevVideo) {
+                                        activeVideoItem = playlistVideos[currentVideoIndex - 1]
+                                    } else {
+                                        exoPlayer.seekTo(0L)
+                                        currentPosition = 0L
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .testTag("player_previous_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.SkipPrevious,
+                                    contentDescription = "Previous Video",
+                                    tint = if (hasPrevVideo) Color.White else Color.White.copy(alpha = 0.55f),
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    if (exoPlayer.isPlaying) {
+                                        exoPlayer.pause()
+                                        isPlaying = false
+                                    } else {
+                                        if (exoPlayer.playbackState == Player.STATE_ENDED) {
+                                            exoPlayer.seekTo(0L)
+                                        }
+                                        exoPlayer.play()
+                                        isPlaying = true
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .testTag("player_play_pause")
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pause" else "Play",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(30.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    if (hasNextVideo) {
+                                        activeVideoItem = playlistVideos[currentVideoIndex + 1]
+                                    }
+                                },
+                                enabled = hasNextVideo,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .testTag("player_next_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.SkipNext,
+                                    contentDescription = "Next Video",
+                                    tint = if (hasNextVideo) Color.White else Color.White.copy(alpha = 0.35f),
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    registerInteraction()
+                                    showMoreVideosSheet = true
+                                }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("player_more_videos_button"),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.VideoLibrary,
+                                contentDescription = "More Videos",
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "More Videos",
+                                color = Color.White,
+                                style = TextStyle(
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    shadow = overlayTextShadow
+                                )
+                            )
+                        }
+                    }
                 }
             }
         }

@@ -40,11 +40,17 @@ interface VaultDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertItem(item: VaultItem): Long
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertItems(items: List<VaultItem>): List<Long>
+
     @Update
     suspend fun updateItem(item: VaultItem)
 
     @Delete
     suspend fun deleteItem(item: VaultItem)
+
+    @Delete
+    suspend fun deleteItems(items: List<VaultItem>)
 
     @Query("DELETE FROM vault_items WHERE id IN (:ids)")
     suspend fun deleteItemsByIds(ids: List<Long>)

@@ -33,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
+import com.example.crypto.AutoHideKeyStoreHelper
 import com.example.crypto.AuthResult
 import com.example.crypto.VaultHeaderManager
 import com.example.data.AutoLockMode
@@ -43,6 +44,7 @@ import com.example.data.VaultStorage
 import com.example.data.db.FolderItem
 import com.example.data.db.VaultDatabase
 import com.example.data.db.VaultItem
+import com.example.service.AutoHideScheduler
 import com.example.service.AutoHideService
 import com.example.ui.auth.AuthScreen
 import com.example.ui.home.HomeScreen
@@ -303,16 +305,27 @@ class MainActivity : ComponentActivity() {
                                             if (key != null) {
                                                 scope.launch(Dispatchers.IO) {
                                                     vaultStorage.reconcileAndRecoverCatalog(key)
-                                                    if (isAutoHideEnabled && watchedFolders.isNotEmpty()) {
-                                                        vaultStorage.sweepWatchedFoldersNow(
-                                                            watchedPaths = watchedFolders,
-                                                            masterKey = key,
-                                                            isDecoy = false
-                                                        )
+                                                    if (isAutoHideEnabled) {
+                                                        AutoHideKeyStoreHelper.sealMasterKeyForAutoHide(this@MainActivity, key)
+                                                        if (watchedFolders.isNotEmpty()) {
+                                                            vaultStorage.sweepWatchedFoldersNow(
+                                                                watchedPaths = watchedFolders,
+                                                                masterKey = key,
+                                                                isDecoy = false
+                                                            )
+                                                        }
                                                     }
+                                                    val currentRealItems = dao.getAllItemsByDecoySync(isDecoy = false)
+                                                    ThumbnailCacheManager.regenerateDarkOrMissingVideoThumbnails(
+                                                        items = currentRealItems,
+                                                        vaultBlobsDir = vaultStorage.vaultBlobsDir,
+                                                        vaultThumbsDir = vaultStorage.vaultThumbsDir,
+                                                        masterKey = key
+                                                    )
                                                 }
                                             }
                                             if (isAutoHideEnabled) {
+                                                AutoHideScheduler.scheduleAll(this@MainActivity)
                                                 syncAutoHideService(true, watchedFolders)
                                             }
                                             true
@@ -326,6 +339,13 @@ class MainActivity : ComponentActivity() {
                                             if (key != null) {
                                                 scope.launch(Dispatchers.IO) {
                                                     vaultStorage.reconcileAndRecoverCatalog(key)
+                                                    val currentDecoyItems = dao.getAllItemsByDecoySync(isDecoy = true)
+                                                    ThumbnailCacheManager.regenerateDarkOrMissingVideoThumbnails(
+                                                        items = currentDecoyItems,
+                                                        vaultBlobsDir = vaultStorage.vaultBlobsDir,
+                                                        vaultThumbsDir = vaultStorage.vaultThumbsDir,
+                                                        masterKey = key
+                                                    )
                                                 }
                                             }
                                             true
@@ -803,18 +823,30 @@ class MainActivity : ComponentActivity() {
                                 isAutoHideEnabled = isAutoHideEnabled,
                                 onToggleAutoHide = { enabled ->
                                     vaultPrefs.setAutoHideEnabled(enabled)
-                                    syncAutoHideService(enabled, watchedFolders)
+                                    val activeKey = masterKey
+                                    if (enabled && activeKey != null && !isDecoyVault) {
+                                        AutoHideKeyStoreHelper.sealMasterKeyForAutoHide(this@MainActivity, activeKey)
+                                        AutoHideScheduler.scheduleAll(this@MainActivity)
+                                        syncAutoHideService(true, vaultPrefs.watchedFolders.value)
+                                        requestBatteryOptimizationExemptionIfNeeded()
+                                    } else {
+                                        AutoHideKeyStoreHelper.clearAutoHideKey(this@MainActivity)
+                                        AutoHideScheduler.cancelAll(this@MainActivity)
+                                        syncAutoHideService(false, vaultPrefs.watchedFolders.value)
+                                    }
                                 },
                                 watchedFolders = watchedFolders,
                                 onToggleWatchedFolder = { path ->
                                     vaultPrefs.toggleWatchedFolder(path)
                                     if (isAutoHideEnabled) {
+                                        AutoHideScheduler.scheduleAll(this@MainActivity)
                                         syncAutoHideService(true, vaultPrefs.watchedFolders.value)
                                     }
                                 },
                                 onAddCustomWatchedFolder = { path ->
                                     vaultPrefs.addCustomWatchedFolder(path)
                                     if (isAutoHideEnabled) {
+                                        AutoHideScheduler.scheduleAll(this@MainActivity)
                                         syncAutoHideService(true, vaultPrefs.watchedFolders.value)
                                     }
                                 },
@@ -835,6 +867,9 @@ class MainActivity : ComponentActivity() {
                                             ).show()
                                         }
                                     }
+                                },
+                                onRequestBatteryOptimizationExemption = {
+                                    requestBatteryOptimizationExemptionIfNeeded()
                                 },
                                 onCreateBackup = {
                                     val dateStr = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
@@ -869,13 +904,36 @@ class MainActivity : ComponentActivity() {
                 putExtra("IS_DECOY", isDecoyVault)
                 putExtra("MASTER_KEY_BYTES", masterKey?.encoded)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+            } catch (_: Throwable) {
             }
         } else {
-            stopService(Intent(this, AutoHideService::class.java))
+            try {
+                stopService(Intent(this, AutoHideService::class.java))
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun requestBatteryOptimizationExemptionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                if (powerManager != null && !powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                    isLaunchingExternalPicker = true
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                }
+            } catch (_: Throwable) {
+                isLaunchingExternalPicker = false
+            }
         }
     }
 
@@ -981,6 +1039,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        if (isChangingConfigurations) {
+            return
+        }
         val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
         if (powerManager != null && !powerManager.isInteractive) {
             exitAndRemoveTaskOnScreenOff()
@@ -989,12 +1050,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        if (isChangingConfigurations) {
+            return
+        }
         val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
         if (powerManager != null && !powerManager.isInteractive) {
             exitAndRemoveTaskOnScreenOff()
             return
         }
-        if (isLaunchingExternalPicker || isChangingConfigurations) {
+        if (isLaunchingExternalPicker) {
             return
         }
         val mode = vaultPrefs.autoLockMode.value
@@ -1040,13 +1104,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fromHex(hex: String): ByteArray {
-        val len = hex.length
-        val data = ByteArray(len / 2)
-        var i = 0
-        while (i < len) {
-            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
-            i += 2
+        return try {
+            val clean = if (hex.length % 2 == 0) hex else "0$hex"
+            val len = clean.length
+            val data = ByteArray(len / 2)
+            var i = 0
+            while (i < len) {
+                data[i / 2] = ((Character.digit(clean[i], 16) shl 4) + Character.digit(clean[i + 1], 16)).toByte()
+                i += 2
+            }
+            data
+        } catch (_: Throwable) {
+            ByteArray(16)
         }
-        return data
     }
 }

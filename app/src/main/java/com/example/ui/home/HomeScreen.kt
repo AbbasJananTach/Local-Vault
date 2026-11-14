@@ -1490,7 +1490,7 @@ fun HomeScreen(
         val targetFolderName = pendingNewFolderNameForPin!!
         CustomPinSetupDialog(
             title = "Folder PIN for '$targetFolderName'",
-            step1Subtitle = "Enter a 1 to 10 digit Custom Folder PIN, then tap Done (✓)",
+            step1Subtitle = "Enter a 4 to 10 digit Custom Folder PIN, then tap Done (✓)",
             step2Subtitle = "Re-enter the exact same Folder PIN, then tap Done (✓)",
             onPinConfirmed = { customPin ->
                 onCreateFolder(
@@ -1797,7 +1797,7 @@ fun HomeScreen(
         val targetFolder = folderPendingCustomPinPad!!
         CustomPinSetupDialog(
             title = "New PIN for '${targetFolder.folderName}'",
-            step1Subtitle = "Enter a new 1 to 10 digit Folder PIN, then tap Done (✓)",
+            step1Subtitle = "Enter a new 4 to 10 digit Folder PIN, then tap Done (✓)",
             step2Subtitle = "Re-enter the new Folder PIN to confirm, then tap Done (✓)",
             onPinConfirmed = { newPin ->
                 onUpdateFolderPin(targetFolder, true, "CUSTOM_PIN", newPin)

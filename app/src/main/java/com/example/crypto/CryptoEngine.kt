@@ -86,7 +86,14 @@ object CryptoEngine {
         val ivSpec = IvParameterSpec(adjustedIv)
         cipher.init(Cipher.DECRYPT_MODE, secretKey, ivSpec)
 
-        val buffer = ByteArray(8192)
+        val chunkBytes = 4 * 1024 * 1024
+        val bufferSize = if (lengthToRead in 1L until chunkBytes.toLong()) {
+            maxOf(65_536, lengthToRead.toInt())
+        } else {
+            chunkBytes
+        }
+        val buffer = ByteArray(bufferSize)
+        val outBuffer = ByteArray(bufferSize + 32)
         var remainingBytesToRead = lengthToRead
         var isFirstBlock = true
 
@@ -100,16 +107,16 @@ object CryptoEngine {
             val read = inputStream.read(buffer, 0, readSize)
             if (read == -1) break
 
-            val decrypted = cipher.update(buffer, 0, read)
-            if (decrypted != null && decrypted.isNotEmpty()) {
+            val outLen = cipher.update(buffer, 0, read, outBuffer, 0)
+            if (outLen > 0) {
                 if (isFirstBlock && startBlockOffset > 0) {
-                    val actualLength = decrypted.size - startBlockOffset.toInt()
+                    val actualLength = outLen - startBlockOffset.toInt()
                     if (actualLength > 0) {
-                        outputStream.write(decrypted, startBlockOffset.toInt(), actualLength)
+                        outputStream.write(outBuffer, startBlockOffset.toInt(), actualLength)
                     }
                     isFirstBlock = false
                 } else {
-                    outputStream.write(decrypted)
+                    outputStream.write(outBuffer, 0, outLen)
                 }
             }
 

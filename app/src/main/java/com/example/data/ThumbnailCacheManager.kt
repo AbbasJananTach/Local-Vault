@@ -3,6 +3,7 @@ package com.example.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.ImageDecoder
 import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
@@ -160,17 +161,7 @@ object ThumbnailCacheManager {
             } else {
                 retriever.setDataSource(context, sourceUri)
             }
-            val rawFrame = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                ?: retriever.frameAtTime
-            if (rawFrame != null) {
-                val maxDim = THUMB_TARGET_SIZE.toFloat()
-                val ratio = minOf(maxDim / rawFrame.width, maxDim / rawFrame.height, 1f)
-                val w = (rawFrame.width * ratio).toInt().coerceAtLeast(1)
-                val h = (rawFrame.height * ratio).toInt().coerceAtLeast(1)
-                Bitmap.createScaledBitmap(rawFrame, w, h, true)
-            } else {
-                null
-            }
+            extractBestVideoFrame(retriever)
         } catch (_: Throwable) {
             null
         } finally {
@@ -179,6 +170,114 @@ object ThumbnailCacheManager {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    /**
+     * Extracts a clear mid-video thumbnail avoiding black fade-in opening frames:
+     * 1. Queries `METADATA_KEY_DURATION`.
+     * 2. Picks primary timestamp at 30% of duration (or 50% for short <= 4s clips).
+     * 3. Checks luminance across a 10x10 pixel grid (`isBitmapMostlyBlack`); if too dark (< 18),
+     *    falls back to 50% then 70% of duration.
+     */
+    private fun extractBestVideoFrame(
+        retriever: MediaMetadataRetriever,
+        knownDurationMs: Long = 0L
+    ): Bitmap? {
+        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()
+            ?.takeIf { it > 0L }
+            ?: knownDurationMs
+
+        var bestDarkFallback: Bitmap? = null
+        var chosenFrame: Bitmap? = null
+
+        if (durationMs > 0L) {
+            val fractions = if (durationMs > 4000L) {
+                doubleArrayOf(0.30, 0.50, 0.70)
+            } else {
+                doubleArrayOf(0.50, 0.30, 0.70)
+            }
+
+            for (fraction in fractions) {
+                val timeUs = (durationMs * fraction * 1000.0).toLong().coerceAtLeast(0L)
+                val frame = try {
+                    retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (frame != null) {
+                    if (!isBitmapMostlyBlack(frame)) {
+                        chosenFrame = frame
+                        break
+                    } else if (bestDarkFallback == null) {
+                        bestDarkFallback = frame
+                    } else {
+                        frame.recycle()
+                    }
+                }
+            }
+        }
+
+        if (chosenFrame == null && bestDarkFallback == null) {
+            chosenFrame = try {
+                retriever.getFrameAtTime(3_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.frameAtTime
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        val finalRaw = chosenFrame ?: bestDarkFallback ?: return null
+        if (chosenFrame != null && bestDarkFallback != null && bestDarkFallback !== chosenFrame) {
+            try {
+                bestDarkFallback.recycle()
+            } catch (_: Throwable) {
+            }
+        }
+
+        val maxDim = THUMB_TARGET_SIZE.toFloat()
+        val ratio = minOf(maxDim / finalRaw.width, maxDim / finalRaw.height, 1f)
+        val w = (finalRaw.width * ratio).toInt().coerceAtLeast(1)
+        val h = (finalRaw.height * ratio).toInt().coerceAtLeast(1)
+        return if (w == finalRaw.width && h == finalRaw.height) {
+            finalRaw
+        } else {
+            val scaled = Bitmap.createScaledBitmap(finalRaw, w, h, true)
+            if (scaled !== finalRaw) {
+                try {
+                    finalRaw.recycle()
+                } catch (_: Throwable) {
+                }
+            }
+            scaled
+        }
+    }
+
+    /**
+     * Samples a 10x10 grid across the bitmap and returns true if average pixel luminance < 18.
+     */
+    fun isBitmapMostlyBlack(bitmap: Bitmap): Boolean {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 0 || h <= 0) return true
+
+        var luminanceSum = 0.0
+        var sampleCount = 0
+        for (gx in 0 until 10) {
+            val x = ((gx + 0.5f) * w / 10f).toInt().coerceIn(0, w - 1)
+            for (gy in 0 until 10) {
+                val y = ((gy + 0.5f) * h / 10f).toInt().coerceIn(0, h - 1)
+                val pixel = bitmap.getPixel(x, y)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                val luminance = 0.299 * r + 0.587 * g + 0.114 * b
+                luminanceSum += luminance
+                sampleCount++
+            }
+        }
+        val avgLuminance = if (sampleCount > 0) luminanceSum / sampleCount else 0.0
+        return avgLuminance < 18.0
     }
 
     private fun saveEncryptedThumbFile(bitmap: Bitmap, thumbFile: File, masterKey: SecretKey) {
@@ -221,7 +320,7 @@ object ThumbnailCacheManager {
             val baseIv = fromHex(item.baseIvHex)
             bitmap = try {
                 if (item.mimeType.startsWith("video")) {
-                    decodeEncryptedVideoThumbnail(blobFile, masterKey, baseIv)
+                    decodeEncryptedVideoThumbnail(blobFile, masterKey, baseIv, item.durationMs)
                 } else {
                     decodeEncryptedImageThumbnail(blobFile, masterKey, baseIv)
                 }
@@ -241,6 +340,49 @@ object ThumbnailCacheManager {
             return@withContext imageBitmap
         }
         return@withContext null
+    }
+
+    /**
+     * Background migration pass run after vault unlock:
+     * Inspects existing video thumbnails in `.LocalVaultData/thumbs/` and regenerates any missing
+     * or mostly-black fade-in thumbnails using smart mid-video frame extraction (30%/50%/70%).
+     */
+    suspend fun regenerateDarkOrMissingVideoThumbnails(
+        items: List<VaultItem>,
+        vaultBlobsDir: File,
+        vaultThumbsDir: File,
+        masterKey: SecretKey
+    ) = withContext(Dispatchers.IO) {
+        val videos = items.filter { it.mimeType.startsWith("video") }
+        for (video in videos) {
+            try {
+                val blobFile = File(vaultBlobsDir, video.encryptedRelativePath)
+                if (!blobFile.exists() || blobFile.length() == 0L) continue
+                val thumbFile = File(vaultThumbsDir, "${video.encryptedRelativePath}.thumb")
+                val existing = loadEncryptedThumbFile(thumbFile, masterKey)
+                val needsRegen = existing == null || isBitmapMostlyBlack(existing)
+                val existingWasDark = existing != null && isBitmapMostlyBlack(existing)
+                existing?.recycle()
+
+                if (needsRegen) {
+                    val baseIv = fromHex(video.baseIvHex)
+                    val regenerated = decodeEncryptedVideoThumbnail(
+                        blobFile = blobFile,
+                        masterKey = masterKey,
+                        baseIv = baseIv,
+                        knownDurationMs = video.durationMs
+                    )
+                    if (regenerated != null && (!existingWasDark || !isBitmapMostlyBlack(regenerated))) {
+                        saveEncryptedThumbFile(regenerated, thumbFile, masterKey)
+                        synchronized(memoryCache) {
+                            memoryCache.remove(video.id)
+                        }
+                    }
+                    regenerated?.recycle()
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private fun decodeEncryptedImageThumbnail(
@@ -380,7 +522,8 @@ object ThumbnailCacheManager {
     private fun decodeEncryptedVideoThumbnail(
         blobFile: File,
         masterKey: SecretKey,
-        baseIv: ByteArray
+        baseIv: ByteArray,
+        knownDurationMs: Long = 0L
     ): Bitmap? {
         val retriever = MediaMetadataRetriever()
         val dataSource = object : MediaDataSource() {
@@ -425,17 +568,7 @@ object ThumbnailCacheManager {
 
         return try {
             retriever.setDataSource(dataSource)
-            val rawFrame = retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                ?: retriever.frameAtTime
-            if (rawFrame != null) {
-                val maxDim = THUMB_TARGET_SIZE.toFloat()
-                val ratio = minOf(maxDim / rawFrame.width, maxDim / rawFrame.height, 1f)
-                val w = (rawFrame.width * ratio).toInt().coerceAtLeast(1)
-                val h = (rawFrame.height * ratio).toInt().coerceAtLeast(1)
-                Bitmap.createScaledBitmap(rawFrame, w, h, true)
-            } else {
-                null
-            }
+            extractBestVideoFrame(retriever, knownDurationMs)
         } catch (_: Throwable) {
             null
         } finally {

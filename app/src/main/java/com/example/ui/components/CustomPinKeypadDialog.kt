@@ -482,7 +482,7 @@ fun PinEntrySheet(
 @Composable
 fun CustomPinSetupDialog(
     title: String,
-    step1Subtitle: String = "Enter a 1 to 10 digit numeric PIN, then tap Done (✓)",
+    step1Subtitle: String = "Enter a 4 to 10 digit numeric PIN, then tap Done (✓)",
     step2Subtitle: String = "Re-enter the exact same PIN to confirm, then tap Done (✓)",
     onPinConfirmed: (String) -> Boolean,
     mismatchOrInvalidError: String = "PIN cannot be used. Try a different PIN.",
@@ -590,8 +590,8 @@ fun CustomPinSetupDialog(
                         currentPin = ""
                     },
                     onDoneClick = {
-                        if (currentPin.isEmpty()) {
-                            errorMessage = "Enter at least 1 digit"
+                        if (currentPin.length < 4) {
+                            errorMessage = "PIN must be at least 4 digits"
                             shakeTrigger++
                             return@CustomNumericKeypad
                         }

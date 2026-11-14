@@ -216,7 +216,7 @@ fun AuthScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Enter 1 to 10 digits, then tap Done (✓)",
+                            text = "Enter 4 to 10 digits, then tap Done (✓)",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -253,13 +253,13 @@ fun AuthScreen(
                                 pinText = ""
                             },
                             onDoneClick = {
-                                if (pinText.isNotEmpty()) {
+                                if (pinText.length >= 4) {
                                     firstEnteredPin = pinText
                                     pinText = ""
                                     errorMessage = ""
                                     setupStep = 2
                                 } else {
-                                    errorMessage = "Enter at least 1 digit"
+                                    errorMessage = "PIN must be at least 4 digits"
                                     shakeTrigger++
                                 }
                             }

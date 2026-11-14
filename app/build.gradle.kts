@@ -105,6 +105,7 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.extractor)
   implementation(libs.androidx.media3.ui)
+  implementation(libs.androidx.work.runtime.ktx)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   testImplementation(libs.androidx.compose.ui.test.junit4)

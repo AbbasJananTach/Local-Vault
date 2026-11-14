@@ -88,6 +88,7 @@ import com.example.data.ThumbnailCacheManager
 import com.example.data.db.FolderItem
 import com.example.data.db.VaultItem
 import com.example.ui.components.CustomPinKeypadDialog
+import com.example.ui.util.findActivity
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -124,7 +125,7 @@ fun PhotoViewerScreen(
     BackHandler { onBack() }
     val context = LocalContext.current
     val currentView = LocalView.current
-    val activity = context as? Activity
+    val activity = remember(context) { context.findActivity() }
 
     if (photoItems.isEmpty()) {
         LaunchedEffect(Unit) { onBack() }
