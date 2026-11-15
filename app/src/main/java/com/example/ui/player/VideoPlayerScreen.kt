@@ -245,21 +245,29 @@ fun VideoPlayerScreen(
             .setEnableDecoderFallback(true)
 
         ExoPlayer.Builder(context, renderersFactory).build().apply {
-            setWakeMode(C.WAKE_MODE_LOCAL)
+            try {
+                setWakeMode(C.WAKE_MODE_LOCAL)
+            } catch (_: Throwable) {
+            }
             playWhenReady = true
             addListener(object : Player.Listener {
                 override fun onVideoSizeChanged(videoSize: VideoSize) {
                     if (videoSize.width > 0 && videoSize.height > 0) {
                         videoResolutionLabel = "${videoSize.width}×${videoSize.height}"
                         val shouldBeLandscape = videoSize.width > videoSize.height
-                        isLandscapeMode = shouldBeLandscape
-                        try {
-                            activity?.requestedOrientation = if (shouldBeLandscape) {
-                                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                            } else {
-                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        if (isLandscapeMode != shouldBeLandscape) {
+                            isLandscapeMode = shouldBeLandscape
+                            try {
+                                val targetOrientation = if (shouldBeLandscape) {
+                                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                } else {
+                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                }
+                                if (activity != null && activity.requestedOrientation != targetOrientation) {
+                                    activity.requestedOrientation = targetOrientation
+                                }
+                            } catch (_: Throwable) {
                             }
-                        } catch (_: Throwable) {
                         }
                     }
                 }

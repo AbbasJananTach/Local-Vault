@@ -88,6 +88,37 @@ class MainActivity : ComponentActivity() {
     private var isLaunchingExternalPicker = false
     private var backgroundedElapsedTime = 0L
     private var pendingImportFolderId: Long? = null
+    private var pendingExportExternalBinsToGallery: Boolean = true
+
+    // FIX 4C: Multi-file document picker for importing & mathematically recovering external .bin files
+    private val importExternalBinLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        isLaunchingExternalPicker = false
+        backgroundedElapsedTime = 0L
+        val key = masterKey
+        if (uris.isNotEmpty() && key != null) {
+            val exportToGallery = pendingExportExternalBinsToGallery
+            lifecycleScope.launch(Dispatchers.IO) {
+                val (recoveredCount, exportedCount) = vaultStorage.importAndRecoverExternalBinFiles(
+                    uris = uris,
+                    masterKey = key,
+                    exportToGallery = exportToGallery
+                )
+                withContext(Dispatchers.Main) {
+                    dbRefreshTick++
+                    val message = if (exportToGallery && exportedCount > 0) {
+                        "Recovered $recoveredCount .bin file(s) & exported $exportedCount playable file(s) to /Pictures/Restored_Vault"
+                    } else if (recoveredCount > 0) {
+                        "Recovered $recoveredCount .bin file(s) into your Vault!"
+                    } else {
+                        "No new .bin files were recovered from selection"
+                    }
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
 
     // Point 2 (Step 1): Universal Picker Configuration.
     // Launches ACTION_OPEN_DOCUMENT with all-files MIME filter and explicit image/video MIME types,
@@ -121,7 +152,7 @@ class MainActivity : ComponentActivity() {
         backgroundedElapsedTime = 0L
         if (destUri != null) {
             lifecycleScope.launch {
-                val result = vaultStorage.exportEncryptedBackup(destUri, headerManager.headerFile)
+                val result = vaultStorage.exportEncryptedBackup(destUri, headerManager.headerFile, masterKey)
                 result.onSuccess { count ->
                     Toast.makeText(
                         this@MainActivity,
@@ -253,19 +284,10 @@ class MainActivity : ComponentActivity() {
                     val rawItems by dao.getAllItems(isDecoy = isDecoyVault).collectAsState(initial = emptyList())
                     val folders by folderDao.getAllFolders(isDecoy = isDecoyVault).collectAsState(initial = emptyList())
 
-                    // Point 1 (Step 3 & 4): Cross-verify against physical encrypted files on disk and deduplicate by vaultFilePath
-                    val items = remember(rawItems, vaultStorage.vaultBlobsDir) {
-                        val physicalNames = try {
-                            vaultStorage.vaultBlobsDir.listFiles()
-                                ?.asSequence()
-                                ?.filter { it.isFile && it.name.endsWith(".bin") && it.length() > 0L }
-                                ?.map { it.name }
-                                ?.toSet() ?: emptySet()
-                        } catch (_: Exception) {
-                            emptySet()
-                        }
+                    // Deduplicate by vaultFilePath (physical file existence and orphan recovery are synchronized by VaultStorage)
+                    val items = remember(rawItems) {
                         rawItems
-                            .filter { it.vaultFilePath.isNotBlank() && it.vaultFilePath in physicalNames }
+                            .filter { it.vaultFilePath.isNotBlank() }
                             .distinctBy { it.vaultFilePath }
                     }
 
@@ -304,7 +326,22 @@ class MainActivity : ComponentActivity() {
                                             currentScreen.value = Screen.Home
                                             if (key != null) {
                                                 scope.launch(Dispatchers.IO) {
-                                                    vaultStorage.reconcileAndRecoverCatalog(key)
+                                                    val report = VaultRepository.recoverOrphanedVaultFiles(
+                                                        context = this@MainActivity,
+                                                        masterKey = key,
+                                                        isDecoy = false,
+                                                        showProgress = false
+                                                    )
+                                                    withContext(Dispatchers.Main) {
+                                                        dbRefreshTick++
+                                                        if (report.recoveredCount > 0) {
+                                                            Toast.makeText(
+                                                                this@MainActivity,
+                                                                "Recovered ${report.recoveredCount} missing file(s) (${report.totalVaultFilesOnDisk} total in vault)",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                    }
                                                     if (isAutoHideEnabled) {
                                                         AutoHideKeyStoreHelper.sealMasterKeyForAutoHide(this@MainActivity, key)
                                                         if (watchedFolders.isNotEmpty()) {
@@ -338,7 +375,22 @@ class MainActivity : ComponentActivity() {
                                             currentScreen.value = Screen.Home
                                             if (key != null) {
                                                 scope.launch(Dispatchers.IO) {
-                                                    vaultStorage.reconcileAndRecoverCatalog(key)
+                                                    val report = VaultRepository.recoverOrphanedVaultFiles(
+                                                        context = this@MainActivity,
+                                                        masterKey = key,
+                                                        isDecoy = true,
+                                                        showProgress = false
+                                                    )
+                                                    withContext(Dispatchers.Main) {
+                                                        dbRefreshTick++
+                                                        if (report.recoveredCount > 0) {
+                                                            Toast.makeText(
+                                                                this@MainActivity,
+                                                                "Recovered ${report.recoveredCount} missing file(s)",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                    }
                                                     val currentDecoyItems = dao.getAllItemsByDecoySync(isDecoy = true)
                                                     ThumbnailCacheManager.regenerateDarkOrMissingVideoThumbnails(
                                                         items = currentDecoyItems,
@@ -372,7 +424,13 @@ class MainActivity : ComponentActivity() {
                                     authAttemptTick++
                                     currentScreen.value = Screen.Home
                                     scope.launch(Dispatchers.IO) {
-                                        vaultStorage.reconcileAndRecoverCatalog(key)
+                                        VaultRepository.recoverOrphanedVaultFiles(
+                                            context = this@MainActivity,
+                                            masterKey = key,
+                                            isDecoy = false,
+                                            showProgress = false
+                                        )
+                                        withContext(Dispatchers.Main) { dbRefreshTick++ }
                                     }
                                 },
                                 onRecoveryPhraseSubmit = { phrase ->
@@ -385,7 +443,22 @@ class MainActivity : ComponentActivity() {
                                         VaultRepository.unlockedFolderIds.clear()
                                         currentScreen.value = Screen.Home
                                         scope.launch(Dispatchers.IO) {
-                                            vaultStorage.reconcileAndRecoverCatalog(key)
+                                            val report = VaultRepository.recoverOrphanedVaultFiles(
+                                                context = this@MainActivity,
+                                                masterKey = key,
+                                                isDecoy = false,
+                                                showProgress = false
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                dbRefreshTick++
+                                                if (report.recoveredCount > 0) {
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "Recovered ${report.recoveredCount} missing file(s) (${report.totalVaultFilesOnDisk} total in vault)",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                            }
                                         }
                                         true
                                     } else false
@@ -612,6 +685,27 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onOpenSettings = {
                                         currentScreen.value = Screen.Settings
+                                    },
+                                    onRecoverMissingFiles = {
+                                        scope.launch(Dispatchers.IO) {
+                                            val report = VaultRepository.recoverOrphanedVaultFiles(
+                                                context = this@MainActivity,
+                                                masterKey = activeKey,
+                                                isDecoy = isDecoyVault,
+                                                showProgress = true
+                                            )
+                                            withContext(Dispatchers.Main) {
+                                                dbRefreshTick++
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    if (report.recoveredCount > 0)
+                                                        "Recovered ${report.recoveredCount} missing file(s)! (${report.totalVaultFilesOnDisk} total in vault)"
+                                                    else
+                                                        "Scan complete: All ${report.totalVaultFilesOnDisk} vault file(s) are already visible",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        }
                                     },
                                     onColumnCountChanged = { cols -> vaultPrefs.setDefaultGridColumns(cols) },
                                     usedStorageBytes = items.sumOf { it.fileSize }
@@ -879,6 +973,50 @@ class MainActivity : ComponentActivity() {
                                 onRestoreBackup = {
                                     isLaunchingExternalPicker = true
                                     restoreBackupLauncher.launch(arrayOf("*/*"))
+                                },
+                                onRecoverMissingFiles = {
+                                    val key = masterKey ?: return@SettingsScreen
+                                    scope.launch(Dispatchers.IO) {
+                                        val report = VaultRepository.recoverOrphanedVaultFiles(
+                                            context = this@MainActivity,
+                                            masterKey = key,
+                                            isDecoy = isDecoyVault,
+                                            showProgress = true
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            dbRefreshTick++
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                if (report.recoveredCount > 0)
+                                                    "Recovered ${report.recoveredCount} missing file(s)! (${report.totalVaultFilesOnDisk} total in vault)"
+                                                else
+                                                    "Scan complete: All ${report.totalVaultFilesOnDisk} vault file(s) are visible in UI",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                },
+                                onImportExternalBinFiles = { exportToGallery ->
+                                    pendingExportExternalBinsToGallery = exportToGallery
+                                    isLaunchingExternalPicker = true
+                                    importExternalBinLauncher.launch(arrayOf("*/*"))
+                                },
+                                onRecoverAndUnhideAllFiles = {
+                                    val key = masterKey ?: return@SettingsScreen
+                                    scope.launch(Dispatchers.IO) {
+                                        val restoredCount = vaultStorage.recoverAndUnhideAllPhysicalFiles(
+                                            masterKey = key,
+                                            isDecoy = isDecoyVault
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            dbRefreshTick++
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "Recovered & restored $restoredCount file(s) to /Pictures/Restored_Vault",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
                                 },
                                 totalPhotosCount = items.count { !it.mimeType.startsWith("video") },
                                 totalVideosCount = items.count { it.mimeType.startsWith("video") },

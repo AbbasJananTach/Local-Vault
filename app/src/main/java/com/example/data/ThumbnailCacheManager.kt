@@ -173,11 +173,12 @@ object ThumbnailCacheManager {
     }
 
     /**
-     * Extracts a clear mid-video thumbnail avoiding black fade-in opening frames:
-     * 1. Queries `METADATA_KEY_DURATION`.
-     * 2. Picks primary timestamp at 30% of duration (or 50% for short <= 4s clips).
-     * 3. Checks luminance across a 10x10 pixel grid (`isBitmapMostlyBlack`); if too dark (< 18),
-     *    falls back to 50% then 70% of duration.
+     * Fix 7: Smart Mid-Video Thumbnail Extraction (Avoid Black Fade-In Frames):
+     * 1. Queries `METADATA_KEY_DURATION` first.
+     * 2. Seeks to 35% of the video duration (`durationMs * 350L` microseconds) with `OPTION_CLOSEST_SYNC`.
+     * 3. Checks `isBitmapMostlyBlack(bitmap)`; if dark/black, tries 50% (`durationMs * 500L`) and
+     *    65% (`durationMs * 650L`) duration until a bright, clear frame from the middle of the video
+     *    is captured. Never grabs 0ms.
      */
     private fun extractBestVideoFrame(
         retriever: MediaMetadataRetriever,
@@ -192,14 +193,13 @@ object ThumbnailCacheManager {
         var chosenFrame: Bitmap? = null
 
         if (durationMs > 0L) {
-            val fractions = if (durationMs > 4000L) {
-                doubleArrayOf(0.30, 0.50, 0.70)
-            } else {
-                doubleArrayOf(0.50, 0.30, 0.70)
-            }
+            val candidateTimesUs = longArrayOf(
+                (durationMs * 350L).coerceAtLeast(500_000L), // 35% of duration
+                (durationMs * 500L).coerceAtLeast(500_000L), // 50% of duration
+                (durationMs * 650L).coerceAtLeast(500_000L)  // 65% of duration
+            )
 
-            for (fraction in fractions) {
-                val timeUs = (durationMs * fraction * 1000.0).toLong().coerceAtLeast(0L)
+            for (timeUs in candidateTimesUs) {
                 val frame = try {
                     retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 } catch (_: Throwable) {
@@ -219,11 +219,24 @@ object ThumbnailCacheManager {
         }
 
         if (chosenFrame == null && bestDarkFallback == null) {
-            chosenFrame = try {
-                retriever.getFrameAtTime(3_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    ?: retriever.frameAtTime
-            } catch (_: Throwable) {
-                null
+            // Fallback mid-clip timestamps in microseconds (3.5s, 5.0s, 1.5s) — never 0ms
+            val fallbackTimesUs = longArrayOf(3_500_000L, 5_000_000L, 1_500_000L)
+            for (fallbackUs in fallbackTimesUs) {
+                val frame = try {
+                    retriever.getFrameAtTime(fallbackUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (frame != null) {
+                    if (!isBitmapMostlyBlack(frame)) {
+                        chosenFrame = frame
+                        break
+                    } else if (bestDarkFallback == null) {
+                        bestDarkFallback = frame
+                    } else {
+                        frame.recycle()
+                    }
+                }
             }
         }
 

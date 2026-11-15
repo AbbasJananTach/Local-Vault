@@ -231,6 +231,7 @@ fun CustomPinKeypadDialog(
     title: String,
     subtitle: String,
     doneButtonLabel: String = "Unlock",
+    enforceMinLength: Boolean = false,
     onVerifyPin: (String) -> Boolean,
     onSuccess: () -> Unit,
     onDismiss: () -> Unit,
@@ -399,9 +400,16 @@ fun CustomPinKeypadDialog(
                             enteredPin = ""
                         },
                         onDoneClick = {
-                            if (enteredPin.isEmpty()) {
-                                errorMessage = "Incorrect PIN"
+                            if (enteredPin.length < 4) {
+                                errorMessage = if (enforceMinLength) {
+                                    "PIN must be at least 4 digits"
+                                } else {
+                                    "PIN must be at least 4 digits"
+                                }
                                 shakeTrigger++
+                                if (!enforceMinLength && enteredPin.isEmpty()) {
+                                    enteredPin = ""
+                                }
                                 return@CustomNumericKeypad
                             }
                             val verified = onVerifyPin(enteredPin)
@@ -459,6 +467,7 @@ fun PinEntrySheet(
     title: String,
     subtitle: String,
     doneButtonLabel: String = "Unlock",
+    enforceMinLength: Boolean = false,
     onVerifyPin: (String) -> Boolean,
     onSuccess: () -> Unit,
     onDismiss: () -> Unit,
@@ -468,6 +477,7 @@ fun PinEntrySheet(
         title = title,
         subtitle = subtitle,
         doneButtonLabel = doneButtonLabel,
+        enforceMinLength = enforceMinLength,
         onVerifyPin = onVerifyPin,
         onSuccess = onSuccess,
         onDismiss = onDismiss,

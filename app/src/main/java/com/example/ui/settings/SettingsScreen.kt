@@ -134,7 +134,10 @@ fun SettingsScreen(
     onAddCustomWatchedFolder: (String) -> Unit,
     onSweepWatchedFoldersNow: () -> Unit = {},
     onRequestBatteryOptimizationExemption: () -> Unit = {},
-    // Backup & Storage
+    // Backup, Recovery & Storage
+    onRecoverMissingFiles: () -> Unit = {},
+    onImportExternalBinFiles: (exportToGallery: Boolean) -> Unit = {},
+    onRecoverAndUnhideAllFiles: () -> Unit = {},
     onCreateBackup: () -> Unit,
     onRestoreBackup: () -> Unit,
     totalPhotosCount: Int,
@@ -161,6 +164,8 @@ fun SettingsScreen(
     var showRecoveryPhraseDialog by remember { mutableStateOf(false) }
     var showFakePinDialog by remember { mutableStateOf(false) }
     var showVisualFolderPickerSheet by remember { mutableStateOf(false) }
+    var showUnhideAllConfirmDialog by remember { mutableStateOf(false) }
+    var showExternalBinOptionsDialog by remember { mutableStateOf(false) }
 
     val presetFolders = remember { VaultPreferences.getPresetWatchableFolders() }
 
@@ -187,6 +192,158 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
+            // 0. EMERGENCY DATA RECOVERY: SCAN & RECOVER MISSING VAULT FILES (.bin) + IMPORT / DECRYPT EXTERNAL .bin FILES
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        width = 1.5.dp,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                        shape = RoundedCornerShape(16.dp)
+                    ),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Sync,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                "Emergency Vault File Recovery",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                "$totalPhotosCount Photos • $totalVideosCount Videos currently indexed",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "Deep-scans all physical vault directories on disk to recover any unindexed or orphaned .bin files (even if .bin.meta was lost), or lets you select external .bin files to recover and decrypt.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onRecoverMissingFiles,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("recover_missing_files_button")
+                    ) {
+                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            "Scan & Recover Missing Vault Files (.bin)",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = { showExternalBinOptionsDialog = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("import_external_bin_files_button")
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            "Import / Decrypt External .bin Files",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { showUnhideAllConfirmDialog = true },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("recover_and_unhide_all_button")
+                    ) {
+                        Icon(Icons.Default.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Recover & Unhide All Vault Files to Gallery")
+                    }
+                }
+            }
+
+            if (showExternalBinOptionsDialog) {
+                AlertDialog(
+                    onDismissRequest = { showExternalBinOptionsDialog = false },
+                    title = { Text("Import / Decrypt External .bin Files", fontWeight = FontWeight.Bold) },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                "Select one or more .bin (and optional .bin.meta / .thumb) files from anywhere on your phone. How would you like to recover them?",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Button(
+                                onClick = {
+                                    showExternalBinOptionsDialog = false
+                                    onImportExternalBinFiles(true)
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Import to Vault & Export Playable Files to Gallery")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    showExternalBinOptionsDialog = false
+                                    onImportExternalBinFiles(false)
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Import Into Vault Only")
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { showExternalBinOptionsDialog = false }) {
+                            Text("Cancel")
+                        }
+                    }
+                )
+            }
+
+            if (showUnhideAllConfirmDialog) {
+                AlertDialog(
+                    onDismissRequest = { showUnhideAllConfirmDialog = false },
+                    title = { Text("Recover & Unhide All Files?", fontWeight = FontWeight.Bold) },
+                    text = {
+                        Text(
+                            "This will scan all physical vault directories for any missing files, decrypt every photo and video in the vault, and restore them back to your phone's Gallery (/Pictures/Restored_Vault)."
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showUnhideAllConfirmDialog = false
+                                onRecoverAndUnhideAllFiles()
+                            }
+                        ) {
+                            Text("Unhide All Now")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showUnhideAllConfirmDialog = false }) {
+                            Text("Cancel")
+                        }
+                    }
+                )
+            }
+
             // 1. GALLERY & DISPLAY CONTROLS (THEME, COLUMNS, FILENAMES)
             Card(
                 modifier = Modifier.fillMaxWidth(),

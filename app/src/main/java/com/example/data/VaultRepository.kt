@@ -1,8 +1,10 @@
 package com.example.data
 
+import android.content.Context
 import android.os.SystemClock
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -10,6 +12,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.Collections
+import javax.crypto.SecretKey
 
 /**
  * Unified Task-Specific Progress Dialog State (Point 4):
@@ -25,17 +28,25 @@ data class VaultProgressState(
 )
 
 /**
- * Central Singleton VaultRepository (Points 1, 4, 6):
- * 1. Global Import & Scan Mutex Lock (`vaultMutex`):
+ * Summary returned by `VaultRepository.recoverOrphanedVaultFiles(...)`.
+ */
+data class VaultRecoveryReport(
+    val recoveredCount: Int,
+    val totalVaultFilesOnDisk: Int
+)
+
+/**
+ * Central Singleton VaultRepository:
+ * 1. Global Import & Scan Mutex Lock (`vaultMutex`) with `NonCancellable` Transaction Guarantee:
  *    Serializes all manual file import loops, folder move loops, Auto-Hide background scans,
- *    and physical file index reconciliations on `Dispatchers.IO`. Any background scan waits
- *    until manual import finishes, preventing concurrent duplicate indexing.
- * 2. Throttled Live Progress State (`progressState`):
- *    Emits task-specific progress updates throttled to once every 100ms (plus 0% and 100%).
- * 3. Instant Screen-Off Session & Player Cleanup (Point 6):
- *    Tracks `isVaultUnlocked`, `unlockedFolderIds`, and any active `ExoPlayer` instance so that
- *    `ACTION_SCREEN_OFF` or `!powerManager.isInteractive` immediately stops/releases video playback
- *    and clears all unlocked states in memory before `finishAffinity()` + `finishAndRemoveTask()`.
+ *    and physical file index reconciliations on `Dispatchers.IO + NonCancellable` so no batch
+ *    import can ever be interrupted mid-way or drop items from the metadata index.
+ * 2. Automatic Orphaned / Invisible Vault File Recovery (`recoverOrphanedVaultFiles`):
+ *    Deep-scans all physical vault directories (`vaultRootDir.walkTopDown()`), inspects decrypted
+ *    headers / magic bytes and sidecars, reconstructs missing `VaultItem` entries, and saves them
+ *    into the persistent metadata index so all physical files appear in the UI and can be unhidden.
+ * 3. Throttled Live Progress State (`progressState`).
+ * 4. Instant Screen-Off Session & Player Cleanup.
  */
 object VaultRepository {
 
@@ -57,12 +68,35 @@ object VaultRepository {
 
     /**
      * Executes any vault import, folder move, background scan, or index reconciliation block
-     * inside the global `vaultMutex` on `Dispatchers.IO`.
+     * inside the global `vaultMutex` on `Dispatchers.IO + NonCancellable` so transactions
+     * complete atomically without mid-batch cancellation.
      */
-    suspend fun <T> withVaultLock(block: suspend () -> T): T = withContext(Dispatchers.IO) {
+    suspend fun <T> withVaultLock(block: suspend () -> T): T = withContext(Dispatchers.IO + NonCancellable) {
         vaultMutex.withLock {
             block()
         }
+    }
+
+    /**
+     * Emergency & Automatic Orphaned Vault File Recovery:
+     * Scans every physical file inside the internal and external vault directories, compares
+     * against the metadata index (`vaultFilePath` / `encryptedRelativePath`), inspects decrypted
+     * header magic bytes (`ftyp`, `mp4`, `mkv`, `webm`, `avi`, `mov`, `FF D8 FF`, `89 50 4E 47`,
+     * `WEBP`, `HEIC`, `GIF`) or sidecar metadata for any unindexed physical file, reconstructs
+     * valid `VaultItem` entries, and persists them immediately.
+     */
+    suspend fun recoverOrphanedVaultFiles(
+        context: Context,
+        masterKey: SecretKey,
+        isDecoy: Boolean = false,
+        showProgress: Boolean = false
+    ): VaultRecoveryReport {
+        val storage = VaultStorage(context.applicationContext)
+        return storage.recoverOrphanedVaultFiles(
+            masterKey = masterKey,
+            isDecoy = isDecoy,
+            showProgress = showProgress
+        )
     }
 
     /**

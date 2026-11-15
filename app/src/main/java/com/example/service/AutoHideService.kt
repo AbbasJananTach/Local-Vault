@@ -12,41 +12,66 @@ import android.os.Build
 import android.os.FileObserver
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.example.crypto.AutoHideKeyStoreHelper
+import com.example.data.VaultPreferences
 import com.example.data.VaultStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Architectural & Privacy Hardening:
- * 1. Specifies `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC` on Android 14+ (API 34+) inside a
- *    `try-catch` block so foreground promotion never throws `MissingForegroundServiceTypeException`
- *    or `ForegroundServiceStartNotAllowedException`.
- * 2. Zero Logcat logging of private file names or filesystem paths.
+ * Fix 3: Thread-Safe Non-Cancelling Auto-Hide Foreground Service:
+ * 1. Completely eliminates `sweepFolder(...)` so `onStartCommand` never launches duplicate
+ *    per-file imports concurrently alongside `sweepWatchedFoldersNow`.
+ * 2. Maintains `@Volatile private var currentWatchedPaths: Set<String>` and an `AtomicBoolean`
+ *    `isSweepInProgress`.
+ * 3. `stopObservers()` ONLY stops/clears `FileObserver` instances and NEVER cancels an active
+ *    sweep coroutine when `MainActivity` refreshes watched paths.
+ * 4. A single long-lived coroutine loop in `serviceScope` runs `vaultStorage.sweepWatchedFoldersNow`
+ *    immediately upon start and every 10 seconds thereafter inside `NonCancellable` protection.
  */
 class AutoHideService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val observers = mutableListOf<FileObserver>()
-    private var periodicSweepJob: kotlinx.coroutines.Job? = null
+    private var periodicSweepJob: Job? = null
+
+    @Volatile
     private var activeMasterKey: SecretKey? = null
+
+    @Volatile
+    private var currentWatchedPaths: Set<String> = emptySet()
+
+    @Volatile
+    private var currentTargetFolderId: Long? = null
+
+    @Volatile
+    private var currentIsDecoy: Boolean = false
+
+    private val isSweepInProgress = AtomicBoolean(false)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         startForegroundServiceNotification()
+        ensurePeriodicSweepLoopRunning()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundServiceNotification()
-        val prefs = com.example.data.VaultPreferences(this)
+        val prefs = VaultPreferences(this)
         val watchedPaths = intent?.getStringArrayExtra("WATCHED_PATHS")
             ?: prefs.watchedFolders.value.toTypedArray()
         val targetFolderId = intent?.getLongExtra("TARGET_FOLDER_ID", -1L)?.let { if (it == -1L) null else it }
@@ -55,10 +80,17 @@ class AutoHideService : Service() {
         if (keyBytes != null && keyBytes.size == 32) {
             activeMasterKey = SecretKeySpec(keyBytes, "AES")
         } else if (activeMasterKey == null) {
-            activeMasterKey = com.example.crypto.AutoHideKeyStoreHelper.unsealMasterKeyForAutoHide(this)
+            activeMasterKey = AutoHideKeyStoreHelper.unsealMasterKeyForAutoHide(this)
         }
 
+        currentWatchedPaths = watchedPaths.toSet()
+        currentTargetFolderId = targetFolderId
+        currentIsDecoy = isDecoy
+
         setupFileObservers(watchedPaths, targetFolderId, isDecoy)
+        ensurePeriodicSweepLoopRunning()
+        triggerImmediateNonCancellingSweep()
+
         return START_STICKY
     }
 
@@ -103,8 +135,6 @@ class AutoHideService : Service() {
         paths.forEach { pathStr ->
             val folder = File(pathStr)
             if (folder.exists() && folder.isDirectory) {
-                sweepFolder(folder, vaultStorage, targetFolderId, isDecoy)
-
                 val observer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     object : FileObserver(folder, CREATE or CLOSE_WRITE or MOVED_TO) {
                         override fun onEvent(event: Int, path: String?) {
@@ -126,34 +156,52 @@ class AutoHideService : Service() {
                     }
                 }
                 observer.startWatching()
-                observers.add(observer)
-            }
-        }
-
-        // Architectural Fix: Android 11-15 Scoped Storage & FUSE mounts sometimes suppress
-        // inotify FileObserver events when camera/social apps move temporary files.
-        // Run a lightweight periodic 10-second directory sweep alongside FileObserver.
-        val pathSet = paths.toSet()
-        periodicSweepJob = serviceScope.launch {
-            while (true) {
-                delay(10_000L)
-                val key = activeMasterKey ?: continue
-                vaultStorage.sweepWatchedFoldersNow(
-                    watchedPaths = pathSet,
-                    masterKey = key,
-                    isDecoy = isDecoy
-                )
+                synchronized(observers) {
+                    observers.add(observer)
+                }
             }
         }
     }
 
-    private fun sweepFolder(folder: File, vaultStorage: VaultStorage, targetFolderId: Long?, isDecoy: Boolean) {
-        serviceScope.launch {
-            folder.listFiles()?.forEach { file ->
-                if (file.isFile && !file.name.startsWith(".") && isMediaFile(file.name)) {
-                    importFileInternal(file, vaultStorage, targetFolderId, isDecoy)
-                }
+    private fun ensurePeriodicSweepLoopRunning() {
+        val existing = periodicSweepJob
+        if (existing != null && existing.isActive) return
+
+        val vaultStorage = VaultStorage(this)
+        periodicSweepJob = serviceScope.launch {
+            while (isActive) {
+                runSingleSweepSafely(vaultStorage)
+                delay(10_000L)
             }
+        }
+    }
+
+    private fun triggerImmediateNonCancellingSweep() {
+        val vaultStorage = VaultStorage(this)
+        serviceScope.launch {
+            runSingleSweepSafely(vaultStorage)
+        }
+    }
+
+    private suspend fun runSingleSweepSafely(vaultStorage: VaultStorage) {
+        val paths = currentWatchedPaths
+        if (paths.isEmpty()) return
+        val key = activeMasterKey ?: AutoHideKeyStoreHelper.unsealMasterKeyForAutoHide(this)?.also {
+            activeMasterKey = it
+        } ?: return
+
+        if (!isSweepInProgress.compareAndSet(false, true)) return
+        try {
+            withContext(Dispatchers.IO + NonCancellable) {
+                vaultStorage.sweepWatchedFoldersNow(
+                    watchedPaths = paths,
+                    masterKey = key,
+                    isDecoy = currentIsDecoy
+                )
+            }
+        } catch (_: Throwable) {
+        } finally {
+            isSweepInProgress.set(false)
         }
     }
 
@@ -161,28 +209,23 @@ class AutoHideService : Service() {
         if (!file.exists() || !file.isFile || file.name.startsWith(".") || !isMediaFile(file.name)) return
         serviceScope.launch {
             delay(700)
-            if (file.exists() && file.length() > 0) {
-                importFileInternal(file, vaultStorage, targetFolderId, isDecoy)
+            if (file.exists() && file.length() > 0L && !isSweepInProgress.get()) {
+                val key = activeMasterKey ?: AutoHideKeyStoreHelper.unsealMasterKeyForAutoHide(this@AutoHideService)?.also {
+                    activeMasterKey = it
+                } ?: return@launch
+                try {
+                    withContext(Dispatchers.IO + NonCancellable) {
+                        vaultStorage.importFile(
+                            uri = Uri.fromFile(file),
+                            originalPathOverride = file.absolutePath,
+                            targetFolderId = targetFolderId,
+                            masterKey = key,
+                            isDecoy = isDecoy
+                        )
+                    }
+                } catch (_: Exception) {
+                }
             }
-        }
-    }
-
-    private suspend fun importFileInternal(
-        file: File,
-        vaultStorage: VaultStorage,
-        targetFolderId: Long?,
-        isDecoy: Boolean
-    ) {
-        val key = activeMasterKey ?: return
-        try {
-            vaultStorage.importFile(
-                uri = Uri.fromFile(file),
-                originalPathOverride = file.absolutePath,
-                targetFolderId = targetFolderId,
-                masterKey = key,
-                isDecoy = isDecoy
-            )
-        } catch (_: Exception) {
         }
     }
 
@@ -190,16 +233,27 @@ class AutoHideService : Service() {
         return VaultStorage.isSupportedMediaFileName(name)
     }
 
+    /**
+     * Fix 3: Stops ONLY the FileObserver instances without cancelling `periodicSweepJob` or any
+     * in-progress `sweepWatchedFoldersNow` import batch!
+     */
     private fun stopObservers() {
-        periodicSweepJob?.cancel()
-        periodicSweepJob = null
-        observers.forEach { it.stopWatching() }
-        observers.clear()
+        synchronized(observers) {
+            observers.forEach {
+                try {
+                    it.stopWatching()
+                } catch (_: Throwable) {
+                }
+            }
+            observers.clear()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopObservers()
+        periodicSweepJob?.cancel()
+        periodicSweepJob = null
         serviceScope.cancel()
     }
 }

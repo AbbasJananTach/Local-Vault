@@ -2,6 +2,7 @@ package com.example.data
 
 import android.content.ContentResolver
 import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -16,6 +17,7 @@ import com.example.data.db.VaultDao
 import com.example.data.db.VaultDatabase
 import com.example.data.db.VaultItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -37,6 +39,7 @@ import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
@@ -102,7 +105,7 @@ class VaultStorage(private val context: Context) {
         get() = File(vaultRootDir, "vault_catalog.enc")
 
     companion object {
-        private const val IO_CHUNK_BUFFER_BYTES = 4 * 1024 * 1024 // 4MB high-throughput buffer
+        private const val IO_CHUNK_BUFFER_BYTES = 1024 * 1024 // 1MB high-throughput, low-heap buffer
         private const val MAX_CONCURRENT_IO_WORKERS = 3
 
         val SUPPORTED_IMAGE_EXTENSIONS = setOf(
@@ -366,13 +369,16 @@ class VaultStorage(private val context: Context) {
     }
 
     /**
-     * Point 1 (Step 3): Physical File Reconciliation (Truth Check).
-     * Cross-verifies the Room database metadata list against actual encrypted `.bin` files physically
-     * on disk (`vaultBlobsDir.listFiles()`). Removes any ghost or duplicate metadata entries pointing
-     * to the same physical file or missing files, and returns a strictly deduplicated list.
+     * Physical File Reconciliation & Automatic Orphan Recovery:
+     * Cross-verifies the Room database metadata list against actual encrypted files physically
+     * on disk. If `masterKey` is provided, also recovers any orphaned/unindexed physical files
+     * so zero files are ever invisible in the UI.
      */
     suspend fun reconcilePhysicalFiles(masterKey: SecretKey? = null): List<VaultItem> =
         VaultRepository.withVaultLock {
+            if (masterKey != null) {
+                recoverOrphanedVaultFilesLocked(masterKey = masterKey, isDecoy = false, showProgress = false)
+            }
             reconcilePhysicalFilesLocked(masterKey)
         }
 
@@ -380,7 +386,13 @@ class VaultStorage(private val context: Context) {
         val physicalBlobNames = try {
             vaultBlobsDir.listFiles()
                 ?.asSequence()
-                ?.filter { it.isFile && it.name.endsWith(".bin") && it.length() > 0L }
+                ?.filter {
+                    it.isFile &&
+                        !it.name.endsWith(".meta") &&
+                        !it.name.endsWith(".thumb") &&
+                        !it.name.startsWith(".tmp_") &&
+                        it.length() > 0L
+                }
                 ?.map { it.name }
                 ?.toSet() ?: emptySet()
         } catch (_: Exception) {
@@ -416,16 +428,1146 @@ class VaultStorage(private val context: Context) {
         return uniqueItemsMap.values.toList()
     }
 
-    private data class ImportWorkerResult(
+    /**
+     * Emergency & Automatic Orphaned / Invisible Vault File Recovery (Requirement 1):
+     * 1. Consolidates any files from internal/external app-specific `.LocalVaultData` fallback
+     *    directories and any rows from internal `local_vault.db`.
+     * 2. Scans EVERY physical file across `vaultRootDir.walkTopDown().filter { it.isFile }`,
+     *    skipping thumbnail files (`*.thumb`) and metadata/database files (`*.meta`, `*.json`,
+     *    `vault_catalog.enc`, `vault.header`, `local_vault.db*`).
+     * 3. Compares every physical vault file on disk against the loaded metadata index
+     *    (`vaultFilePath` / `encryptedRelativePath`).
+     * 4. For EVERY physical file on disk that is missing from the metadata index:
+     *    - Recovers from `.meta` sidecar, `vault_catalog.enc`, or legacy DB if available.
+     *    - Otherwise inspects its decrypted header / magic bytes (first 16..64 bytes decrypted)
+     *      or file extension to automatically detect whether it is a Video (`ftyp`, `mp4`, `mkv`,
+     *      `webm`, `avi`, `mov`) or an Image (`FF D8 FF` JPG, `89 50 4E 47` PNG, `WEBP`, `HEIC`, `GIF`).
+     *    - Reconstructs a valid `VaultItem` metadata entry (assigning to root vault or subfolder,
+     *      setting real file size and lastModified timestamp, and generating missing thumbnails).
+     *    - Saves all recovered items into the metadata index immediately.
+     */
+    suspend fun recoverOrphanedVaultFiles(
+        masterKey: SecretKey,
+        isDecoy: Boolean = false,
+        showProgress: Boolean = false
+    ): VaultRecoveryReport = VaultRepository.withVaultLock {
+        recoverOrphanedVaultFilesLocked(
+            masterKey = masterKey,
+            isDecoy = isDecoy,
+            showProgress = showProgress
+        )
+    }
+
+    internal suspend fun recoverOrphanedVaultFilesLocked(
+        masterKey: SecretKey?,
+        isDecoy: Boolean = false,
+        showProgress: Boolean = false
+    ): VaultRecoveryReport {
+        try {
+            if (showProgress) {
+                VaultRepository.updateProgress(
+                    title = "Scanning Vault Directories...",
+                    currentItem = 0,
+                    totalItems = 100,
+                    percentage = 5,
+                    subText = "Checking physical vault storage...",
+                    forceEmit = true
+                )
+            }
+
+            // Step 1: Migrate any stranded blobs/thumbs/sidecars from internal/app-specific fallback directories
+            consolidateFallbackVaultDirectories()
+
+            // Step 2: Load any legacy rows from internal app database if separate from active external DB
+            val legacyDbItemsByPath = LinkedHashMap<String, VaultItem>()
+            val legacyDbFoldersById = LinkedHashMap<Long, FolderItem>()
+            loadLegacyInternalDatabaseItems(legacyDbItemsByPath, legacyDbFoldersById)
+
+            // Step 3: Load existing folders and recover any missing folders from catalog or legacy DB
+            val existingFolders = folderDao.getAllFoldersSync().associateBy { it.id }.toMutableMap()
+            for ((fId, legFolder) in legacyDbFoldersById) {
+                if (!existingFolders.containsKey(fId)) {
+                    val newId = folderDao.insertFolder(legFolder)
+                    existingFolders[newId] = legFolder.copy(id = newId)
+                }
+            }
+
+            val catalogItemsByPath = LinkedHashMap<String, VaultItem>()
+            if (masterKey != null && catalogFile.exists() && catalogFile.length() > 0L) {
+                try {
+                    val decrypted = CryptoEngine.decryptAesGcm(catalogFile.readBytes(), masterKey)
+                    val root = JSONObject(String(decrypted, Charsets.UTF_8))
+                    val foldersArr = root.optJSONArray("folders")
+                    if (foldersArr != null) {
+                        for (i in 0 until foldersArr.length()) {
+                            val fObj = foldersArr.getJSONObject(i)
+                            val fId = fObj.optLong("id", 0L)
+                            if (fId !in existingFolders) {
+                                val folder = FolderItem(
+                                    id = fId,
+                                    folderName = fObj.getString("folderName"),
+                                    isLocked = fObj.optBoolean("isLocked", false),
+                                    lockType = fObj.optString("lockType", "MAIN_PIN"),
+                                    customPinSaltHex = fObj.optString("customPinSaltHex", "").ifEmpty { null },
+                                    customPinSlotAHex = fObj.optString("customPinSlotAHex", "").ifEmpty { null },
+                                    isDecoy = fObj.optBoolean("isDecoy", false)
+                                )
+                                folderDao.insertFolder(folder)
+                                existingFolders[fId] = folder
+                            }
+                        }
+                    }
+
+                    val itemsArr = root.optJSONArray("items")
+                    if (itemsArr != null) {
+                        for (i in 0 until itemsArr.length()) {
+                            val obj = itemsArr.getJSONObject(i)
+                            val relPath = obj.optString("encryptedRelativePath", "")
+                            if (relPath.isNotBlank()) {
+                                val rawFolderId = obj.optLong("folderId", -1L)
+                                catalogItemsByPath[relPath] = VaultItem(
+                                    id = 0L,
+                                    fileName = obj.optString("fileName", relPath),
+                                    originalPath = obj.optString("originalPath", ""),
+                                    encryptedRelativePath = relPath,
+                                    mimeType = obj.optString("mimeType", "image/jpeg"),
+                                    fileSize = obj.optLong("fileSize", 0L),
+                                    dateAdded = obj.optLong("dateAdded", System.currentTimeMillis()),
+                                    folderId = if (rawFolderId == -1L) null else rawFolderId,
+                                    isFavorite = obj.optBoolean("isFavorite", false),
+                                    isDecoy = obj.optBoolean("isDecoy", false),
+                                    durationMs = obj.optLong("durationMs", 0L),
+                                    baseIvHex = obj.optString("baseIvHex", "")
+                                )
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+
+            // Step 4: Scan all .meta sidecar files across vaultRootDir
+            val sidecarItemsByPath = LinkedHashMap<String, VaultItem>()
+            if (masterKey != null) {
+                try {
+                    vaultRootDir.walkTopDown()
+                        .filter { it.isFile && it.name.endsWith(".meta") && it.length() > 0L }
+                        .forEach { metaFile ->
+                            val recovered = readSidecarMetadata(metaFile, masterKey)
+                            if (recovered != null && recovered.encryptedRelativePath.isNotBlank()) {
+                                sidecarItemsByPath[recovered.encryptedRelativePath] = recovered.copy(id = 0L)
+                            }
+                        }
+                } catch (_: Throwable) {
+                }
+            }
+
+            // Step 5: Walk EVERY physical media/blob file across vaultRootDir
+            val rootCanonical = try {
+                vaultRootDir.canonicalPath
+            } catch (_: Throwable) {
+                vaultRootDir.absolutePath
+            }
+            val blobsCanonical = try {
+                vaultBlobsDir.canonicalPath
+            } catch (_: Throwable) {
+                vaultBlobsDir.absolutePath
+            }
+            val thumbsCanonical = try {
+                vaultThumbsDir.canonicalPath
+            } catch (_: Throwable) {
+                vaultThumbsDir.absolutePath
+            }
+
+            val skippedNames = setOf(
+                "vault_catalog.enc",
+                "vault.header",
+                "local_vault.db",
+                "local_vault.db-wal",
+                "local_vault.db-shm",
+                "local_vault.db-journal",
+                "vault_manifest.json"
+            )
+
+            // Collect (blobFileInBlobsDir, optionalSubfolderName)
+            val physicalFilesWithSubfolder = ArrayList<Pair<File, String?>>()
+            val seenBlobFileNames = HashSet<String>()
+
+            val allCandidateDiskFiles = try {
+                vaultRootDir.walkTopDown().filter { it.isFile }.toList()
+            } catch (_: Throwable) {
+                vaultBlobsDir.listFiles()?.filter { it.isFile } ?: emptyList()
+            }
+
+            for (diskFile in allCandidateDiskFiles) {
+                val name = diskFile.name
+                if (diskFile.length() <= 0L) continue
+                if (name in skippedNames) continue
+                if (name.startsWith(".tmp_") || name.startsWith("local_vault.db")) continue
+                if (name.endsWith(".thumb") || name.endsWith(".meta") || name.endsWith(".json") || name.endsWith(".enc") || name.endsWith(".header")) continue
+
+                val parentCanonical = try {
+                    diskFile.parentFile?.canonicalPath ?: ""
+                } catch (_: Throwable) {
+                    diskFile.parentFile?.absolutePath ?: ""
+                }
+                if (parentCanonical.startsWith(thumbsCanonical)) continue
+
+                var subfolderName: String? = null
+                var finalBlobFile = diskFile
+
+                if (parentCanonical != blobsCanonical) {
+                    if (parentCanonical != rootCanonical && parentCanonical.startsWith(rootCanonical)) {
+                        val relParent = parentCanonical.removePrefix(rootCanonical).trimStart('/', '\\')
+                        val topFolder = relParent.substringBefore('/').substringBefore('\\')
+                        if (topFolder.isNotBlank() && topFolder != "blobs" && topFolder != "thumbs") {
+                            subfolderName = topFolder
+                        }
+                    }
+                    // Ensure the physical file is inside vaultBlobsDir so standard blob lookups succeed
+                    val targetName = if (name.endsWith(".bin")) name else "${UUID.randomUUID()}.bin"
+                    val destInBlobs = File(vaultBlobsDir, targetName)
+                    if (!destInBlobs.exists()) {
+                        try {
+                            if (!diskFile.renameTo(destInBlobs)) {
+                                diskFile.copyTo(destInBlobs, overwrite = true)
+                                diskFile.delete()
+                            }
+                            finalBlobFile = destInBlobs
+                        } catch (_: Throwable) {
+                        }
+                    } else {
+                        finalBlobFile = destInBlobs
+                    }
+                }
+
+                if (finalBlobFile.exists() && finalBlobFile.length() > 0L && seenBlobFileNames.add(finalBlobFile.name)) {
+                    physicalFilesWithSubfolder.add(finalBlobFile to subfolderName)
+                }
+            }
+
+            // Step 6: Reconcile existing DB rows, collect sibling 16-byte plaintext headers,
+            // and repair any previously recovered items whose baseIvHex had a fallback IV
+            val validExistingItems = reconcilePhysicalFilesLocked(masterKey = null)
+            val siblingPlainHeaders = if (masterKey != null) {
+                collectSiblingPlainHeaders(masterKey, validExistingItems)
+            } else {
+                ArrayList()
+            }
+
+            val indexedByPath = ConcurrentHashMap<String, VaultItem>()
+            var repairedExistingCount = 0
+
+            for (item in validExistingItems) {
+                var repairedItem = item
+                var needsUpdate = false
+                if (repairedItem.folderId != null && repairedItem.folderId !in existingFolders) {
+                    repairedItem = repairedItem.copy(folderId = null)
+                    needsUpdate = true
+                }
+                // Ensure items in Real Vault have isDecoy = false so they are never hidden
+                if (!isDecoy && repairedItem.isDecoy) {
+                    repairedItem = repairedItem.copy(isDecoy = false)
+                    needsUpdate = true
+                }
+
+                // If an existing item has an unverified IV (e.g. from an earlier fallback recovery),
+                // check if its decrypted header is valid; if not, run mathematical AES-CTR baseIv recovery!
+                if (masterKey != null) {
+                    val blobFile = File(vaultBlobsDir, repairedItem.encryptedRelativePath)
+                    if (blobFile.exists() && blobFile.length() >= 16L) {
+                        val currentIv = fromHex(repairedItem.baseIvHex)
+                        val headerSample = readFirstNBytes(blobFile, 64)
+                        val currentDecrypted = if (currentIv.size == 16) {
+                            CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, currentIv)
+                        } else {
+                            ByteArray(0)
+                        }
+                        if (CryptoEngine.verifyDecryptedHeader64(currentDecrypted) == null) {
+                            val recoveredIvAndMime = recoverOrphanedBinBaseIvAndMime(
+                                blobFile = blobFile,
+                                masterKey = masterKey,
+                                siblingPlainHeaders = siblingPlainHeaders
+                            )
+                            if (recoveredIvAndMime != null) {
+                                val (trueIv, trueMime) = recoveredIvAndMime
+                                val newExt = extensionFromMimeType(trueMime)
+                                val baseTitle = repairedItem.fileName.substringBeforeLast('.')
+                                    .replace("Recovered_Photo", if (trueMime.startsWith("video")) "Recovered_Video" else "Recovered_Photo")
+                                val updatedFileName = "$baseTitle$newExt"
+                                val unlockedDecrypted = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, trueIv)
+                                if (unlockedDecrypted.size >= 16) {
+                                    siblingPlainHeaders.add(0, unlockedDecrypted.copyOfRange(0, 16))
+                                }
+                                val durMs = if (trueMime.startsWith("video") && repairedItem.durationMs <= 0L) {
+                                    extractEncryptedVideoDurationMs(blobFile, masterKey, trueIv)
+                                } else {
+                                    repairedItem.durationMs
+                                }
+                                repairedItem = repairedItem.copy(
+                                    fileName = updatedFileName,
+                                    mimeType = trueMime,
+                                    durationMs = durMs,
+                                    baseIvHex = toHex(trueIv),
+                                    isDecoy = false
+                                )
+                                needsUpdate = true
+                                repairedExistingCount++
+                            }
+                        }
+                    }
+                }
+
+                if (needsUpdate) {
+                    vaultDao.updateItem(repairedItem)
+                    if (masterKey != null) {
+                        writeSidecarMetadata(repairedItem, masterKey)
+                    }
+                }
+                indexedByPath[repairedItem.encryptedRelativePath] = repairedItem
+            }
+
+            // Map folder names to IDs for subfolder assignment
+            val foldersByNameLower = existingFolders.values
+                .associateBy { it.folderName.lowercase(Locale.US) }
+                .toMutableMap()
+
+            val newlyRecoveredItems = CopyOnWriteArrayList<VaultItem>()
+            val totalPhysicalCount = physicalFilesWithSubfolder.size
+            var seqCounter = indexedByPath.size + 1
+
+            for ((index, pair) in physicalFilesWithSubfolder.withIndex()) {
+                val (blobFile, subfolderName) = pair
+                val blobName = blobFile.name
+
+                if (showProgress && totalPhysicalCount > 0) {
+                    val pct = (((index + 1) * 90L) / totalPhysicalCount.toLong()).toInt().coerceIn(5, 95)
+                    VaultRepository.updateProgress(
+                        title = "Scanning Vault Directories...",
+                        currentItem = index + 1,
+                        totalItems = totalPhysicalCount,
+                        percentage = pct,
+                        subText = "Checked ${index + 1} / $totalPhysicalCount physical files"
+                    )
+                }
+
+                if (indexedByPath.containsKey(blobName)) {
+                    continue
+                }
+
+                // Resolve subfolder ID if physical file was inside a named subfolder
+                var resolvedSubfolderId: Long? = null
+                if (!subfolderName.isNullOrBlank()) {
+                    val existingFolder = foldersByNameLower[subfolderName.lowercase(Locale.US)]
+                    if (existingFolder != null) {
+                        resolvedSubfolderId = existingFolder.id
+                    } else {
+                        val newFolder = FolderItem(
+                            folderName = subfolderName,
+                            isLocked = false,
+                            lockType = "MAIN_PIN",
+                            isDecoy = false
+                        )
+                        val newFolderId = folderDao.insertFolder(newFolder)
+                        val savedFolder = newFolder.copy(id = newFolderId)
+                        existingFolders[newFolderId] = savedFolder
+                        foldersByNameLower[subfolderName.lowercase(Locale.US)] = savedFolder
+                        resolvedSubfolderId = newFolderId
+                    }
+                }
+
+                // Try Sidecar -> Catalog -> Legacy DB -> Mathematical AES-CTR Header Reconstruction
+                val knownMeta = sidecarItemsByPath[blobName]
+                    ?: catalogItemsByPath[blobName]
+                    ?: legacyDbItemsByPath[blobName]
+
+                val recoveredItem = if (knownMeta != null && knownMeta.baseIvHex.length == 32) {
+                    val validFolderId = knownMeta.folderId?.takeIf { it in existingFolders } ?: resolvedSubfolderId
+                    // Verify if knownMeta's baseIvHex actually decrypts to a valid media header; if not, try mathematical recovery
+                    val verifiedKnownItem = if (masterKey != null) {
+                        val headerSample = readFirstNBytes(blobFile, 64)
+                        val knownIv = fromHex(knownMeta.baseIvHex)
+                        val dec = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, knownIv)
+                        if (CryptoEngine.verifyDecryptedHeader64(dec) != null) {
+                            if (dec.size >= 16) siblingPlainHeaders.add(0, dec.copyOfRange(0, 16))
+                            knownMeta
+                        } else {
+                            val mathRecovered = recoverOrphanedBinBaseIvAndMime(blobFile, masterKey, siblingPlainHeaders)
+                            if (mathRecovered != null) {
+                                val (trueIv, trueMime) = mathRecovered
+                                val decTrue = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, trueIv)
+                                if (decTrue.size >= 16) siblingPlainHeaders.add(0, decTrue.copyOfRange(0, 16))
+                                knownMeta.copy(
+                                    mimeType = trueMime,
+                                    baseIvHex = toHex(trueIv)
+                                )
+                            } else {
+                                knownMeta
+                            }
+                        }
+                    } else {
+                        knownMeta
+                    }
+
+                    verifiedKnownItem.copy(
+                        id = 0L,
+                        encryptedRelativePath = blobName,
+                        fileSize = blobFile.length(),
+                        folderId = validFolderId,
+                        isDecoy = false
+                    )
+                } else {
+                    reconstructVaultItemFromPhysicalFile(
+                        blobFile = blobFile,
+                        subfolderId = resolvedSubfolderId,
+                        sequenceIndex = seqCounter++,
+                        masterKey = masterKey,
+                        isDecoy = false,
+                        siblingPlainHeaders = siblingPlainHeaders
+                    )
+                }
+
+                newlyRecoveredItems.add(recoveredItem)
+                indexedByPath[blobName] = recoveredItem
+            }
+
+            if (newlyRecoveredItems.isNotEmpty()) {
+                val toInsert = newlyRecoveredItems.toList()
+                val insertedIds = ArrayList<Long>(toInsert.size)
+                toInsert.chunked(500).forEach { chunk ->
+                    insertedIds.addAll(vaultDao.insertItems(chunk))
+                }
+                if (masterKey != null) {
+                    toInsert.forEachIndexed { idx, item ->
+                        val savedId = insertedIds.getOrElse(idx) { item.id }
+                        val savedItem = item.copy(id = savedId)
+                        writeSidecarMetadata(savedItem, masterKey)
+                        // Link existing thumbnail or generate missing mid-video/image thumbnail
+                        val thumbFile = File(vaultThumbsDir, "${savedItem.encryptedRelativePath}.thumb")
+                        if (!thumbFile.exists() || thumbFile.length() <= 0L) {
+                            try {
+                                ThumbnailCacheManager.loadThumbnail(
+                                    item = savedItem,
+                                    blobFile = File(vaultBlobsDir, savedItem.encryptedRelativePath),
+                                    masterKey = masterKey
+                                )
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (masterKey != null) {
+                // Ensure every indexed item has a sidecar metadata file on disk
+                val finalItems = vaultDao.getAllItemsSync()
+                for (item in finalItems) {
+                    val metaFile = File(vaultBlobsDir, "${item.encryptedRelativePath}.meta")
+                    if (!metaFile.exists() || metaFile.length() <= 0L) {
+                        writeSidecarMetadata(item, masterKey)
+                    }
+                }
+                syncEncryptedCatalogLocked(masterKey)
+            }
+
+            val totalRecoveredOrRepaired = newlyRecoveredItems.size + repairedExistingCount
+
+            if (showProgress) {
+                VaultRepository.updateProgress(
+                    title = "Scanning Vault Directories...",
+                    currentItem = totalPhysicalCount,
+                    totalItems = totalPhysicalCount,
+                    percentage = 100,
+                    subText = "Recovered $totalRecoveredOrRepaired file(s) • $totalPhysicalCount total",
+                    forceEmit = true
+                )
+                VaultRepository.hideProgress()
+            }
+
+            return VaultRecoveryReport(
+                recoveredCount = totalRecoveredOrRepaired,
+                totalVaultFilesOnDisk = indexedByPath.size
+            )
+        } catch (_: Throwable) {
+            if (showProgress) {
+                VaultRepository.hideProgress()
+            }
+            val currentCount = try {
+                vaultDao.getAllItemsSync().size
+            } catch (_: Throwable) {
+                0
+            }
+            return VaultRecoveryReport(recoveredCount = 0, totalVaultFilesOnDisk = currentCount)
+        }
+    }
+
+    /**
+     * Fix 4A: Mathematical AES-CTR `baseIv` + `mimeType` recovery for `.bin` files missing `.bin.meta`.
+     */
+    fun recoverOrphanedBinBaseIvAndMime(
+        blobFile: File,
+        masterKey: SecretKey,
+        siblingPlainHeaders: List<ByteArray> = collectSiblingPlainHeaders(masterKey)
+    ): Pair<ByteArray, String>? {
+        return CryptoEngine.recoverOrphanedBinBaseIvAndMime(
+            blobFile = blobFile,
+            masterKey = masterKey,
+            siblingPlainHeaders = siblingPlainHeaders
+        )
+    }
+
+    /**
+     * Builds a prioritized list of 16-byte plaintext media headers ($P_0$) from:
+     * 1) Already-indexed vault `.bin` blobs (decrypted using their known `baseIvHex`).
+     * 2) Existing media files in `/storage/emulated/0/Pictures/Restored_Vault`, watched folders,
+     *    `DCIM/Camera`, `Movies`, `Download`, and `Pictures` (up to 60 files).
+     */
+    private fun collectSiblingPlainHeaders(
+        masterKey: SecretKey,
+        existingVaultItems: List<VaultItem> = emptyList()
+    ): MutableList<ByteArray> {
+        val headers = ArrayList<ByteArray>(80)
+        val seenHex = HashSet<String>()
+
+        // 1. From already-indexed vault blobs with valid baseIvHex
+        for (item in existingVaultItems) {
+            if (headers.size >= 40) break
+            if (item.baseIvHex.length != 32) continue
+            try {
+                val blob = File(vaultBlobsDir, item.encryptedRelativePath)
+                if (!blob.exists() || blob.length() < 64L) continue
+                val iv = fromHex(item.baseIvHex)
+                val enc64 = readFirstNBytes(blob, 64)
+                val dec64 = CryptoEngine.decryptHeaderBytesCtr(enc64, masterKey, iv)
+                if (CryptoEngine.verifyDecryptedHeader64(dec64) != null) {
+                    val p0 = dec64.copyOfRange(0, 16)
+                    val hex = toHex(p0)
+                    if (seenHex.add(hex)) {
+                        headers.add(p0)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        // 2. From sibling files on device storage (Restored_Vault, watched folders, DCIM/Camera, Movies, Download)
+        val extRoot = Environment.getExternalStorageDirectory()
+        val candidateDirs = LinkedHashSet<File>().apply {
+            add(File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Restored_Vault"))
+            try {
+                VaultPreferences(context).watchedFolders.value.forEach { add(File(it)) }
+            } catch (_: Throwable) {
+            }
+            add(File(extRoot, "DCIM/Camera"))
+            add(File(extRoot, "Movies"))
+            add(File(extRoot, "Download"))
+            add(File(extRoot, "Pictures"))
+            add(File(extRoot, "WhatsApp/Media/WhatsApp Video"))
+            add(File(extRoot, "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video"))
+            add(File(extRoot, "Telegram/Telegram Video"))
+            add(File(extRoot, "Movies/Instagram"))
+        }
+
+        var deviceFilesSampled = 0
+        for (dir in candidateDirs) {
+            if (deviceFilesSampled >= 50) break
+            if (!dir.exists() || !dir.isDirectory) continue
+            val files = try {
+                dir.listFiles()
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+
+            for (f in files) {
+                if (deviceFilesSampled >= 50) break
+                if (!f.isFile || f.length() < 64L || !isSupportedMediaFileName(f.name)) continue
+                val first16 = readFirstNBytes(f, 16)
+                if (first16.size == 16 && CryptoEngine.detectMediaSignature(first16) != null) {
+                    deviceFilesSampled++
+                    val hex = toHex(first16)
+                    if (seenHex.add(hex)) {
+                        headers.add(first16)
+                    }
+                }
+            }
+        }
+
+        return headers
+    }
+
+    private fun readFirstNBytes(file: File, count: Int): ByteArray {
+        val buf = ByteArray(count)
+        var total = 0
+        try {
+            FileInputStream(file).use { fis ->
+                while (total < count) {
+                    val r = fis.read(buf, total, count - total)
+                    if (r <= 0) break
+                    total += r
+                }
+            }
+        } catch (_: Throwable) {
+            return ByteArray(0)
+        }
+        return if (total == count) buf else if (total > 0) buf.copyOfRange(0, total) else ByteArray(0)
+    }
+
+    /**
+     * Extracts the duration in milliseconds of an AES-CTR encrypted video blob using a streaming
+     * `MediaDataSource` over `RandomAccessFile` + `CryptoEngine.calculateCtrIvForOffset`.
+     */
+    private fun extractEncryptedVideoDurationMs(
+        blobFile: File,
+        masterKey: SecretKey,
+        baseIv: ByteArray
+    ): Long {
+        if (!blobFile.exists() || blobFile.length() < 64L || baseIv.size != 16) return 0L
+        val retriever = MediaMetadataRetriever()
+        return try {
+            val raf = java.io.RandomAccessFile(blobFile, "r")
+            val fileLen = blobFile.length()
+            val dataSource = object : android.media.MediaDataSource() {
+                override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+                    if (position >= fileLen) return -1
+                    val toRead = minOf(size.toLong(), fileLen - position).toInt()
+                    if (toRead <= 0) return -1
+                    val blockAlignedStart = (position / 16L) * 16L
+                    val skipBytes = (position - blockAlignedStart).toInt()
+                    val cipherLen = skipBytes + toRead
+                    val cipherBuf = ByteArray(cipherLen)
+                    val actualRead: Int
+                    synchronized(raf) {
+                        raf.seek(blockAlignedStart)
+                        actualRead = raf.read(cipherBuf, 0, cipherLen)
+                    }
+                    if (actualRead <= skipBytes) return -1
+                    val counterIv = CryptoEngine.calculateCtrIvForOffset(baseIv, blockAlignedStart)
+                    val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(counterIv))
+                    val plainBuf = cipher.doFinal(cipherBuf, 0, actualRead)
+                    val available = (plainBuf.size - skipBytes).coerceAtMost(toRead)
+                    System.arraycopy(plainBuf, skipBytes, buffer, offset, available)
+                    return available
+                }
+
+                override fun getSize(): Long = fileLen
+
+                override fun close() {
+                    try {
+                        raf.close()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            retriever.setDataSource(dataSource)
+            val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            try {
+                dataSource.close()
+            } catch (_: Throwable) {
+            }
+            dur
+        } catch (_: Throwable) {
+            0L
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /**
+     * Reconstructs a valid `VaultItem` for an unindexed physical `.bin` file on disk:
+     * 1. Checks if raw header bytes match unencrypted media (and encrypts in-place if so).
+     * 2. Uses `recoverOrphanedBinBaseIvAndMime(blobFile, masterKey, siblingPlainHeaders)` to
+     *    mathematically recover the exact 16-byte `baseIv` via AES-ECB inversion ($C_0 \oplus P_0$)
+     *    verified against Block 1/2/3 (`moov`/`mdat`/`free` atoms or `IHDR`/`JFIF` markers).
+     * 3. Extracts video duration and links existing `.bin.thumb` in `vaultThumbsDir`.
+     * 4. Even if an exotic file doesn't match a known header, still recovers and indexes the `.bin`
+     *    file with a fallback IV and its decrypted `.bin.thumb` thumbnail so NO `.bin` file is ever left behind.
+     */
+    private fun reconstructVaultItemFromPhysicalFile(
+        blobFile: File,
+        subfolderId: Long?,
+        sequenceIndex: Int,
+        masterKey: SecretKey?,
+        isDecoy: Boolean,
+        siblingPlainHeaders: MutableList<ByteArray> = ArrayList()
+    ): VaultItem {
+        val blobName = blobFile.name
+        val actualHeader = readFirstNBytes(blobFile, 64)
+
+        val deterministicIv = if (masterKey != null) {
+            CryptoEngine.deriveDeterministicIv(masterKey, blobName)
+        } else {
+            ByteArray(16)
+        }
+
+        var chosenIv: ByteArray = deterministicIv
+        var detectedMime: String? = null
+        var detectedExt: String? = null
+
+        // 1. Check if raw header bytes match unencrypted media magic bytes
+        val rawSig = CryptoEngine.detectMediaSignature(actualHeader)
+        if (rawSig != null && masterKey != null) {
+            val tempEnc = File(vaultBlobsDir, ".tmp_enc_$blobName")
+            try {
+                val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+                cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(deterministicIv))
+                BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
+                    FileOutputStream(tempEnc).use { fos ->
+                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                            CipherOutputStream(bos, cipher).use { cos ->
+                                val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
+                                var r: Int
+                                while (bis.read(buf).also { r = it } != -1) {
+                                    cos.write(buf, 0, r)
+                                }
+                                cos.flush()
+                            }
+                            bos.flush()
+                        }
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+                if (tempEnc.exists() && tempEnc.length() == blobFile.length()) {
+                    blobFile.delete()
+                    tempEnc.renameTo(blobFile)
+                } else {
+                    tempEnc.delete()
+                }
+            } catch (_: Throwable) {
+                tempEnc.delete()
+            }
+            chosenIv = deterministicIv
+            detectedMime = rawSig.mimeType
+            detectedExt = rawSig.extension
+        } else if (rawSig != null) {
+            detectedMime = rawSig.mimeType
+            detectedExt = rawSig.extension
+        }
+
+        // 2. Mathematical AES-CTR baseIv + mimeType recovery (checks deterministicIv, zeroIv, sibling headers, and ftyp/PNG/JPEG matrix)
+        if (detectedMime == null && masterKey != null && actualHeader.size >= 16) {
+            val mathRecovered = recoverOrphanedBinBaseIvAndMime(
+                blobFile = blobFile,
+                masterKey = masterKey,
+                siblingPlainHeaders = siblingPlainHeaders
+            )
+            if (mathRecovered != null) {
+                chosenIv = mathRecovered.first
+                detectedMime = mathRecovered.second
+                detectedExt = extensionFromMimeType(detectedMime!!)
+                val dec64 = CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, chosenIv)
+                if (dec64.size >= 16) {
+                    siblingPlainHeaders.add(0, dec64.copyOfRange(0, 16))
+                }
+            }
+        }
+
+        // 3. Fallback to file extension or size heuristic if an exotic container didn't match standard headers
+        if (detectedMime == null) {
+            val baseNameWithoutBin = blobName.removeSuffix(".bin")
+            val extCandidate = baseNameWithoutBin.substringAfterLast('.', "").lowercase(Locale.US)
+            when {
+                extCandidate in SUPPORTED_VIDEO_EXTENSIONS -> {
+                    detectedMime = guessMimeTypeFromExtension(baseNameWithoutBin, "video/mp4")
+                    detectedExt = ".$extCandidate"
+                }
+                extCandidate in SUPPORTED_IMAGE_EXTENSIONS -> {
+                    detectedMime = guessMimeTypeFromExtension(baseNameWithoutBin, "image/jpeg")
+                    detectedExt = ".$extCandidate"
+                }
+                blobFile.length() >= 2L * 1024L * 1024L -> {
+                    detectedMime = "video/mp4"
+                    detectedExt = ".mp4"
+                }
+                else -> {
+                    detectedMime = "image/jpeg"
+                    detectedExt = ".jpg"
+                }
+            }
+        }
+
+        val finalMime = detectedMime ?: "video/mp4"
+        val finalExt = detectedExt ?: extensionFromMimeType(finalMime)
+        val isVideo = finalMime.startsWith("video")
+        val prefix = if (isVideo) "Recovered_Video" else "Recovered_Photo"
+        val cleanOriginalName = if (!blobName.endsWith(".bin") && isSupportedMediaFileName(blobName)) {
+            blobName
+        } else {
+            String.format(Locale.US, "%s_%03d%s", prefix, sequenceIndex, finalExt)
+        }
+
+        val durationMs = if (isVideo && masterKey != null) {
+            extractEncryptedVideoDurationMs(blobFile, masterKey, chosenIv)
+        } else {
+            0L
+        }
+
+        val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        val restoredPath = File(File(picturesDir, "Restored_Vault"), cleanOriginalName).absolutePath
+        val lastMod = blobFile.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
+
+        return VaultItem(
+            id = 0L,
+            fileName = cleanOriginalName,
+            originalPath = restoredPath,
+            encryptedRelativePath = blobName,
+            mimeType = finalMime,
+            fileSize = blobFile.length(),
+            dateAdded = lastMod,
+            folderId = subfolderId,
+            isFavorite = false,
+            isDecoy = false,
+            durationMs = durationMs,
+            baseIvHex = toHex(chosenIv)
+        )
+    }
+
+    /**
+     * Fix 4C: Imports external `.bin` (and optional `.meta` / `.thumb`) files selected by the user
+     * from anywhere on their phone into `vaultBlobsDir` / `vaultThumbsDir`, runs mathematical
+     * `baseIv` recovery (`reconcileAndRecoverCatalog`), and optionally decrypts/exports them
+     * directly to `/storage/emulated/0/Pictures/Restored_Vault` as playable `.mp4` / `.jpg` files.
+     *
+     * Returns `Pair(importedToVaultCount, exportedToGalleryCount)`.
+     */
+    suspend fun importAndRecoverExternalBinFiles(
+        uris: List<Uri>,
+        masterKey: SecretKey,
+        exportToGallery: Boolean
+    ): Pair<Int, Int> = VaultRepository.withVaultLock {
+        if (uris.isEmpty()) return@withVaultLock Pair(0, 0)
+
+        val resolver = context.contentResolver
+        val importedBlobNames = LinkedHashSet<String>()
+        val totalUris = uris.size
+
+        VaultRepository.updateProgress(
+            title = if (exportToGallery) "Importing & Decrypting .bin Files..." else "Importing .bin Files to Vault...",
+            currentItem = 0,
+            totalItems = totalUris,
+            percentage = 0,
+            subText = "0 / $totalUris files",
+            forceEmit = true
+        )
+
+        try {
+            uris.forEachIndexed { idx, uri ->
+                try {
+                    var displayName = ""
+                    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx != -1 && !c.isNull(nameIdx)) {
+                                displayName = c.getString(nameIdx) ?: ""
+                            }
+                        }
+                    }
+                    if (displayName.isBlank()) {
+                        displayName = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':')
+                            ?: "${UUID.randomUUID()}.bin"
+                    }
+                    // Strip Android duplicate suffixes like " (1)" before extension if needed
+                    val sanitizedName = displayName.replace(Regex("\\s+\\(\\d+\\)(?=\\.)"), "")
+
+                    val targetFile = when {
+                        sanitizedName.endsWith(".thumb", ignoreCase = true) -> File(vaultThumbsDir, sanitizedName)
+                        sanitizedName.endsWith(".meta", ignoreCase = true) -> File(vaultBlobsDir, sanitizedName)
+                        sanitizedName.endsWith(".bin", ignoreCase = true) -> {
+                            importedBlobNames.add(sanitizedName)
+                            File(vaultBlobsDir, sanitizedName)
+                        }
+                        else -> {
+                            val binName = "$sanitizedName.bin"
+                            importedBlobNames.add(binName)
+                            File(vaultBlobsDir, binName)
+                        }
+                    }
+
+                    resolver.openInputStream(uri)?.use { input ->
+                        BufferedInputStream(input, IO_CHUNK_BUFFER_BYTES).use { bis ->
+                            FileOutputStream(targetFile).use { fos ->
+                                BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                                    val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
+                                    var r: Int
+                                    while (bis.read(buf).also { r = it } != -1) {
+                                        bos.write(buf, 0, r)
+                                    }
+                                    bos.flush()
+                                }
+                                try {
+                                    fos.fd.sync()
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+
+                val done = idx + 1
+                val pct = ((done * 60L) / totalUris.toLong()).toInt().coerceIn(5, 60)
+                VaultRepository.updateProgress(
+                    title = if (exportToGallery) "Importing & Decrypting .bin Files..." else "Importing .bin Files to Vault...",
+                    currentItem = done,
+                    totalItems = totalUris,
+                    percentage = pct,
+                    subText = "Copied $done / $totalUris files"
+                )
+            }
+
+            // Reconcile and mathematically recover all .bin files in vaultBlobsDir
+            val report = recoverOrphanedVaultFilesLocked(
+                masterKey = masterKey,
+                isDecoy = false,
+                showProgress = false
+            )
+
+            var exportedCount = 0
+            if (exportToGallery) {
+                val allItemsByPath = vaultDao.getAllItemsSync().associateBy { it.encryptedRelativePath }
+                val targetsToExport = if (importedBlobNames.isNotEmpty()) {
+                    importedBlobNames.mapNotNull { allItemsByPath[it] }
+                } else {
+                    allItemsByPath.values.toList()
+                }
+
+                val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                val exportDir = File(picturesDir, "Restored_Vault")
+                if (!exportDir.exists()) exportDir.mkdirs()
+                val scannedPaths = ArrayList<String>()
+
+                targetsToExport.forEachIndexed { idx, item ->
+                    val blobFile = File(vaultBlobsDir, item.encryptedRelativePath)
+                    if (blobFile.exists() && blobFile.length() > 0L) {
+                        val baseIv = fromHex(item.baseIvHex)
+                        var outFile = File(exportDir, item.fileName)
+                        if (outFile.exists()) {
+                            val namePart = item.fileName.substringBeforeLast('.')
+                            val extPart = item.fileName.substringAfterLast('.', "")
+                            val suffix = if (extPart.isNotEmpty()) ".$extPart" else ""
+                            outFile = File(exportDir, "${namePart}_${System.currentTimeMillis()}$suffix")
+                        }
+                        try {
+                            BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
+                                FileOutputStream(outFile).use { fos ->
+                                    BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                                        CryptoEngine.decryptStreamCtr(
+                                            inputStream = bis,
+                                            outputStream = bos,
+                                            secretKey = masterKey,
+                                            baseIv = baseIv
+                                        )
+                                        bos.flush()
+                                    }
+                                    try {
+                                        fos.fd.sync()
+                                    } catch (_: Throwable) {
+                                    }
+                                }
+                            }
+                            if (outFile.exists() && outFile.length() > 0L) {
+                                exportedCount++
+                                scannedPaths.add(outFile.absolutePath)
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    val pct = 60 + (((idx + 1) * 40L) / targetsToExport.size.coerceAtLeast(1)).toInt().coerceIn(0, 40)
+                    VaultRepository.updateProgress(
+                        title = "Exporting Decrypted Media...",
+                        currentItem = idx + 1,
+                        totalItems = targetsToExport.size,
+                        percentage = pct,
+                        subText = "Decrypted ${idx + 1} / ${targetsToExport.size} to /Pictures/Restored_Vault"
+                    )
+                }
+
+                if (scannedPaths.isNotEmpty()) {
+                    try {
+                        MediaScannerConnection.scanFile(context, scannedPaths.toTypedArray(), null, null)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+
+            Pair(maxOf(importedBlobNames.size, report.recoveredCount), exportedCount)
+        } finally {
+            VaultRepository.hideProgress()
+        }
+    }
+
+    /**
+     * Consolidates any `.bin`, `.meta`, and `.thumb` files that may have been created inside
+     * internal or app-specific fallback `.LocalVaultData` directories into the primary `vaultRootDir`.
+     */
+    private fun consolidateFallbackVaultDirectories() {
+        val activeRootPath = try {
+            vaultRootDir.canonicalPath
+        } catch (_: Throwable) {
+            vaultRootDir.absolutePath
+        }
+
+        val fallbackRoots = listOfNotNull(
+            context.getExternalFilesDir(null)?.let { File(it, ".LocalVaultData") },
+            File(context.filesDir, ".LocalVaultData")
+        )
+
+        for (fbRoot in fallbackRoots) {
+            if (!fbRoot.exists() || !fbRoot.isDirectory) continue
+            val fbCanonical = try {
+                fbRoot.canonicalPath
+            } catch (_: Throwable) {
+                fbRoot.absolutePath
+            }
+            if (fbCanonical == activeRootPath) continue
+
+            val fbBlobs = File(fbRoot, "blobs")
+            if (fbBlobs.exists() && fbBlobs.isDirectory) {
+                fbBlobs.listFiles()?.forEach { f ->
+                    if (f.isFile && f.length() > 0L) {
+                        val dest = File(vaultBlobsDir, f.name)
+                        if (!dest.exists()) {
+                            try {
+                                f.copyTo(dest, overwrite = false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            }
+
+            val fbThumbs = File(fbRoot, "thumbs")
+            if (fbThumbs.exists() && fbThumbs.isDirectory) {
+                fbThumbs.listFiles()?.forEach { f ->
+                    if (f.isFile && f.length() > 0L) {
+                        val dest = File(vaultThumbsDir, f.name)
+                        if (!dest.exists()) {
+                            try {
+                                f.copyTo(dest, overwrite = false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reads any rows from the internal `local_vault.db` SQLite file if the app previously ran
+     * before `MANAGE_EXTERNAL_STORAGE` switched the database path to external `.LocalVaultData`.
+     */
+    private fun loadLegacyInternalDatabaseItems(
+        outItems: MutableMap<String, VaultItem>,
+        outFolders: MutableMap<Long, FolderItem>
+    ) {
+        try {
+            val internalDbFile = context.getDatabasePath("local_vault.db")
+            val externalDbFile = File(vaultRootDir, "local_vault.db")
+            if (!internalDbFile.exists() || internalDbFile.length() <= 0L) return
+            if (internalDbFile.canonicalPath == externalDbFile.canonicalPath) return
+
+            SQLiteDatabase.openDatabase(
+                internalDbFile.absolutePath,
+                null,
+                SQLiteDatabase.OPEN_READONLY
+            ).use { db ->
+                try {
+                    db.rawQuery("SELECT id, folderName, isLocked, lockType, customPinSaltHex, customPinSlotAHex, isDecoy FROM folder_items", null)?.use { c ->
+                        while (c.moveToNext()) {
+                            val id = c.getLong(0)
+                            outFolders[id] = FolderItem(
+                                id = id,
+                                folderName = c.getString(1) ?: "Folder",
+                                isLocked = c.getInt(2) != 0,
+                                lockType = c.getString(3) ?: "MAIN_PIN",
+                                customPinSaltHex = c.getString(4),
+                                customPinSlotAHex = c.getString(5),
+                                isDecoy = c.getInt(6) != 0
+                            )
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+
+                try {
+                    db.rawQuery(
+                        "SELECT fileName, originalPath, encryptedRelativePath, mimeType, fileSize, dateAdded, folderId, isFavorite, isDecoy, durationMs, baseIvHex FROM vault_items",
+                        null
+                    )?.use { c ->
+                        while (c.moveToNext()) {
+                            val relPath = c.getString(2) ?: ""
+                            if (relPath.isNotBlank()) {
+                                outItems[relPath] = VaultItem(
+                                    id = 0L,
+                                    fileName = c.getString(0) ?: relPath,
+                                    originalPath = c.getString(1) ?: "",
+                                    encryptedRelativePath = relPath,
+                                    mimeType = c.getString(3) ?: "image/jpeg",
+                                    fileSize = c.getLong(4),
+                                    dateAdded = c.getLong(5),
+                                    folderId = if (c.isNull(6)) null else c.getLong(6),
+                                    isFavorite = c.getInt(7) != 0,
+                                    isDecoy = c.getInt(8) != 0,
+                                    durationMs = c.getLong(9),
+                                    baseIvHex = c.getString(10) ?: ""
+                                )
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Requirement 1 & 3: Scans all physical vault directories, recovers any missing/orphaned
+     * physical files into the metadata index, and immediately unhides (restores) ALL vault files
+     * back to `/storage/emulated/0/Pictures/Restored_Vault` (or their original paths).
+     */
+    suspend fun recoverAndUnhideAllPhysicalFiles(
+        masterKey: SecretKey,
+        isDecoy: Boolean = false
+    ): Pair<Int, String> {
+        // First recover any orphaned physical files on disk into the database
+        recoverOrphanedVaultFiles(masterKey = masterKey, isDecoy = isDecoy, showProgress = false)
+        val allItems = VaultRepository.withVaultLock {
+            vaultDao.getAllItemsByDecoySync(isDecoy = isDecoy)
+        }
+        if (allItems.isEmpty()) {
+            return Pair(0, "/Pictures/Restored_Vault")
+        }
+        return unhideBatchWithDestination(allItems, masterKey)
+    }
+
+    /**
+     * Holds a staged encrypted file produced by a parallel worker BEFORE deleting the original
+     * source file from the phone's gallery (Requirement 2: Two-Phase Commit Transaction Safety).
+     */
+    private data class StagedImportItem(
         val item: VaultItem,
-        val deletedSourcePath: String?
+        val blobFile: File,
+        val sourceUri: Uri,
+        val resolvedFsPath: String,
+        val mediaStoreId: Long?
     )
 
     private val folderCreationLock = Any()
 
     /**
-     * Sweeps all watched folder paths inside `VaultRepository.vaultMutex` using bounded parallel
-     * workers (`Semaphore(3)`) + 4MB buffers and a single catalog flush at the end.
+     * Fix 2: Sweeps all watched folder paths inside `VaultRepository.vaultMutex` using bounded
+     * parallel workers (`Semaphore(3)`), where `encryptAndPrepareItemWorker` commits each file
+     * atomically inside `withContext(NonCancellable)` (`tempBlobFile` -> `fd.sync()` -> `renameTo`
+     * -> `vaultDao.insertItem` -> `writeSidecarMetadata` -> verify DB + `.meta`) BEFORE deleting
+     * the original file from the phone.
      */
     suspend fun sweepWatchedFoldersNow(
         watchedPaths: Set<String>,
@@ -449,11 +1591,12 @@ class VaultStorage(private val context: Context) {
         if (candidateFiles.isEmpty()) return@withVaultLock 0
 
         val semaphore = Semaphore(permits = MAX_CONCURRENT_IO_WORKERS)
-        val importedResults = ArrayList<ImportWorkerResult>()
         val seenPaths = ConcurrentHashMap.newKeySet<String>()
+        val deletedPaths = CopyOnWriteArrayList<String>()
+        val importedItems = CopyOnWriteArrayList<VaultItem>()
 
         try {
-            val workerOutputs = coroutineScope {
+            val workerResults = coroutineScope {
                 candidateFiles.map { file ->
                     async(Dispatchers.IO) {
                         semaphore.withPermit {
@@ -464,40 +1607,30 @@ class VaultStorage(private val context: Context) {
                                 masterKey = masterKey,
                                 isDecoy = isDecoy,
                                 alreadyImportedPathsInBatch = seenPaths,
-                                runMediaScanImmediately = false
+                                deletedPathsOut = deletedPaths
                             )
                         }
                     }
                 }.awaitAll()
             }
-            workerOutputs.filterNotNullTo(importedResults)
-
-            if (importedResults.isNotEmpty()) {
-                val insertedItems = importedResults.map { it.item }
-                insertedItems.chunked(500).forEach { chunk ->
-                    vaultDao.insertItems(chunk)
-                }
-                // Write sidecar metadata with finalized list
-                insertedItems.forEach { writeSidecarMetadata(it, masterKey) }
-            }
+            importedItems.addAll(workerResults.filterNotNull())
         } finally {
-            if (importedResults.isNotEmpty()) {
-                reconcilePhysicalFilesLocked(masterKey)
+            if (importedItems.isNotEmpty()) {
                 syncEncryptedCatalogLocked(masterKey)
-                val deletedPaths = importedResults.mapNotNull { it.deletedSourcePath }.distinct()
                 if (deletedPaths.isNotEmpty()) {
                     try {
-                        MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
+                        MediaScannerConnection.scanFile(context, deletedPaths.distinct().toTypedArray(), null, null)
                     } catch (_: Exception) {
                     }
                 }
             }
         }
-        importedResults.size
+        importedItems.size
     }
 
     /**
-     * Imports a single URI inside the global `VaultRepository.vaultMutex`.
+     * Imports a single URI inside the global `VaultRepository.vaultMutex` using the self-contained
+     * atomic `encryptAndPrepareItemWorker`.
      */
     suspend fun importFile(
         uri: Uri,
@@ -506,29 +1639,31 @@ class VaultStorage(private val context: Context) {
         masterKey: SecretKey,
         isDecoy: Boolean = false
     ): VaultItem? = VaultRepository.withVaultLock {
-        val result = encryptAndPrepareItemWorker(
+        val deletedPaths = CopyOnWriteArrayList<String>()
+        val savedItem = encryptAndPrepareItemWorker(
             uri = uri,
             originalPathOverride = originalPathOverride,
             targetFolderId = targetFolderId,
             masterKey = masterKey,
             isDecoy = isDecoy,
             alreadyImportedPathsInBatch = null,
-            runMediaScanImmediately = true
+            deletedPathsOut = deletedPaths
         ) ?: return@withVaultLock null
 
-        val insertedId = vaultDao.insertItem(result.item)
-        val savedItem = result.item.copy(id = insertedId)
-        writeSidecarMetadata(savedItem, masterKey)
         syncEncryptedCatalogLocked(masterKey)
+        if (deletedPaths.isNotEmpty()) {
+            try {
+                MediaScannerConnection.scanFile(context, deletedPaths.distinct().toTypedArray(), null, null)
+            } catch (_: Exception) {
+            }
+        }
         savedItem
     }
 
     /**
-     * Ultra-Fast Batch URI Import (Hotfix #2):
-     * - 4MB (`4 * 1024 * 1024`) chunk buffer per worker.
-     * - Bounded parallel encryption with `Semaphore(permits = 3)` on `Dispatchers.IO`.
-     * - Batch Room insert + single `syncEncryptedCatalogLocked` flush inside `finally`.
-     * - Single batch `MediaScannerConnection.scanFile` notification at the end.
+     * Fix 2: Thread-Safe Parallel Batch URI Import where each file is atomically encrypted,
+     * persisted to Room DB, and written to `.bin.meta` inside `withContext(NonCancellable)`
+     * BEFORE its original source file is deleted.
      */
     suspend fun importBatchUris(
         uris: List<Uri>,
@@ -552,7 +1687,8 @@ class VaultStorage(private val context: Context) {
         val semaphore = Semaphore(permits = MAX_CONCURRENT_IO_WORKERS)
         val completedCount = AtomicInteger(0)
         val importedSourcePathsInBatch = ConcurrentHashMap.newKeySet<String>()
-        val results = ArrayList<ImportWorkerResult>()
+        val importedItems = CopyOnWriteArrayList<VaultItem>()
+        val deletedPaths = CopyOnWriteArrayList<String>()
 
         try {
             val workerOutputs = coroutineScope {
@@ -566,17 +1702,16 @@ class VaultStorage(private val context: Context) {
                                 masterKey = masterKey,
                                 isDecoy = isDecoy,
                                 alreadyImportedPathsInBatch = importedSourcePathsInBatch,
-                                runMediaScanImmediately = false
+                                deletedPathsOut = deletedPaths
                             )
                             val done = completedCount.incrementAndGet()
-                            val pct = ((done * 100L) / total.toLong()).toInt().coerceIn(0, 100)
+                            val pct = ((done * 95L) / total.toLong()).toInt().coerceIn(0, 95)
                             VaultRepository.updateProgress(
                                 title = "Importing Media...",
                                 currentItem = done,
                                 totalItems = total,
                                 percentage = pct,
-                                subText = "$done / $total files",
-                                forceEmit = done == total
+                                subText = "$done / $total files"
                             )
                             res
                         }
@@ -584,38 +1719,33 @@ class VaultStorage(private val context: Context) {
                 }.awaitAll()
             }
 
-            workerOutputs.filterNotNullTo(results)
-            if (results.isNotEmpty()) {
-                val items = results.map { it.item }
-                val insertedIds = ArrayList<Long>(items.size)
-                items.chunked(500).forEach { chunk ->
-                    insertedIds.addAll(vaultDao.insertItems(chunk))
-                }
-                items.forEachIndexed { idx, item ->
-                    val savedId = insertedIds.getOrElse(idx) { item.id }
-                    writeSidecarMetadata(item.copy(id = savedId), masterKey)
-                }
-            }
+            importedItems.addAll(workerOutputs.filterNotNull())
+
+            VaultRepository.updateProgress(
+                title = "Importing Media...",
+                currentItem = total,
+                totalItems = total,
+                percentage = 100,
+                subText = "${importedItems.size} / $total files",
+                forceEmit = true
+            )
         } finally {
-            reconcilePhysicalFilesLocked(masterKey)
             syncEncryptedCatalogLocked(masterKey)
-            val deletedPaths = results.mapNotNull { it.deletedSourcePath }.distinct()
             if (deletedPaths.isNotEmpty()) {
                 try {
-                    MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
+                    MediaScannerConnection.scanFile(context, deletedPaths.distinct().toTypedArray(), null, null)
                 } catch (_: Exception) {
                 }
             }
             VaultRepository.hideProgress()
         }
-        results.size
+        importedItems.size
     }
 
     /**
-     * Ultra-Fast Batch Direct File Path Import (Hotfix #2):
-     * - Uses 4MB buffer + bounded parallel workers (`Semaphore(permits = 3)`) on `Dispatchers.IO`.
-     * - Single batch Room insert + single `syncEncryptedCatalogLocked` flush in `finally`.
-     * - Single batch `MediaScannerConnection.scanFile` notification at the end.
+     * Fix 2: Thread-Safe Parallel Batch Direct File Import where each file is atomically encrypted,
+     * persisted to Room DB, and written to `.bin.meta` inside `withContext(NonCancellable)`
+     * BEFORE its original source file is deleted.
      */
     suspend fun importBatchDirectFiles(
         paths: List<String>,
@@ -642,7 +1772,8 @@ class VaultStorage(private val context: Context) {
         val semaphore = Semaphore(permits = MAX_CONCURRENT_IO_WORKERS)
         val completedCount = AtomicInteger(0)
         val importedSourcePathsInBatch = ConcurrentHashMap.newKeySet<String>()
-        val results = ArrayList<ImportWorkerResult>()
+        val importedItems = CopyOnWriteArrayList<VaultItem>()
+        val deletedPaths = CopyOnWriteArrayList<String>()
 
         try {
             val workerOutputs = coroutineScope {
@@ -657,17 +1788,16 @@ class VaultStorage(private val context: Context) {
                                 masterKey = masterKey,
                                 isDecoy = isDecoy,
                                 alreadyImportedPathsInBatch = importedSourcePathsInBatch,
-                                runMediaScanImmediately = false
+                                deletedPathsOut = deletedPaths
                             )
                             val done = completedCount.incrementAndGet()
-                            val pct = ((done * 100L) / total.toLong()).toInt().coerceIn(0, 100)
+                            val pct = ((done * 95L) / total.toLong()).toInt().coerceIn(0, 95)
                             VaultRepository.updateProgress(
                                 title = "Importing Media...",
                                 currentItem = done,
                                 totalItems = total,
                                 percentage = pct,
-                                subText = "$done / $total files",
-                                forceEmit = done == total
+                                subText = "$done / $total files"
                             )
                             res
                         }
@@ -675,259 +1805,319 @@ class VaultStorage(private val context: Context) {
                 }.awaitAll()
             }
 
-            workerOutputs.filterNotNullTo(results)
-            if (results.isNotEmpty()) {
-                val items = results.map { it.item }
-                val insertedIds = ArrayList<Long>(items.size)
-                items.chunked(500).forEach { chunk ->
-                    insertedIds.addAll(vaultDao.insertItems(chunk))
-                }
-                items.forEachIndexed { idx, item ->
-                    val savedId = insertedIds.getOrElse(idx) { item.id }
-                    writeSidecarMetadata(item.copy(id = savedId), masterKey)
-                }
-            }
+            importedItems.addAll(workerOutputs.filterNotNull())
+
+            VaultRepository.updateProgress(
+                title = "Importing Media...",
+                currentItem = total,
+                totalItems = total,
+                percentage = 100,
+                subText = "${importedItems.size} / $total files",
+                forceEmit = true
+            )
         } finally {
-            reconcilePhysicalFilesLocked(masterKey)
             syncEncryptedCatalogLocked(masterKey)
-            val deletedPaths = results.mapNotNull { it.deletedSourcePath }.distinct()
             if (deletedPaths.isNotEmpty()) {
                 try {
-                    MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
+                    MediaScannerConnection.scanFile(context, deletedPaths.distinct().toTypedArray(), null, null)
                 } catch (_: Exception) {
                 }
             }
             VaultRepository.hideProgress()
         }
-        results.size
+        importedItems.size
     }
 
     /**
-     * Thread-safe file encryption worker using a 4MB (`4 * 1024 * 1024`) buffer.
-     * Writes the encrypted `.bin` blob + `.thumb`, deletes the original source file,
-     * and returns `ImportWorkerResult` without touching Room or `vault_catalog.enc` so callers
-     * can batch-insert and flush the encrypted catalog once per batch.
+     * Fix 2: Self-Contained, Atomic, Non-Cancellable Per-File Encryption & Persistence Worker:
+     * 1) Encrypts the stream into a temporary file `val tempBlobFile = File(vaultBlobsDir, ".tmp_$blobName")`.
+     * 2) Flushes `cipherOut`, flushes `bufferedOut`, and calls `fos.fd.sync()` before closing `FileOutputStream`.
+     * 3) Verifies `tempBlobFile.exists() && tempBlobFile.length() == totalWritten && totalWritten > 0L`.
+     *    Renames `tempBlobFile.renameTo(blobFile)` and verifies `blobFile.exists() && blobFile.length() == totalWritten`.
+     * 4) Generates the thumbnail into `thumbFile`.
+     * 5) Inside `withContext(NonCancellable)`:
+     *    - Constructs the `VaultItem`.
+     *    - Immediately inserts it into Room Database: `val insertedId = vaultDao.insertItem(item)` and creates `val savedItem = item.copy(id = insertedId)`.
+     *    - Immediately writes and `fd.sync()`s the sidecar metadata file `writeSidecarMetadata(savedItem, masterKey)` (`.bin.meta`)
+     *      so `baseIvHex` and all metadata are permanently on disk before the original file is ever touched!
+     *    - Verifies that `vaultDao.getItemByEncryptedPath(blobName) != null` AND `File(vaultBlobsDir, "$blobName.meta").let { it.exists() && it.length() > 0L }`.
+     * 6) ONLY AFTER `blobFile`, `metaFile` (`.bin.meta`), and the Room DB row (`insertedId > 0L`) are all verified on disk,
+     *    calls `deleteOriginalFileSafely(...)`! If any check fails, deletes `blobFile`/`tempBlobFile` and NEVER deletes the user's original file!
      */
-    private fun encryptAndPrepareItemWorker(
+    private suspend fun encryptAndPrepareItemWorker(
         uri: Uri,
         originalPathOverride: String? = null,
         targetFolderId: Long? = null,
         masterKey: SecretKey,
         isDecoy: Boolean = false,
         alreadyImportedPathsInBatch: MutableSet<String>? = null,
-        runMediaScanImmediately: Boolean = false
-    ): ImportWorkerResult? {
+        deletedPathsOut: MutableList<String>? = null
+    ): VaultItem? {
         val resolver = context.contentResolver
         var fileName = ""
         var reportedSize = 0L
         var mimeType = try {
             resolver.getType(uri) ?: ""
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             ""
         }
         var resolvedFsPath = originalPathOverride ?: ""
         var mediaStoreId: Long? = null
 
-        // 1. Resolve metadata from direct file path or content URI
-        if (resolvedFsPath.isNotEmpty()) {
-            val f = File(resolvedFsPath)
-            if (!f.exists() || !f.isFile || f.length() <= 0L) {
-                return null
-            }
-            fileName = f.name
-            reportedSize = f.length()
-        } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
-            val path = uri.path ?: ""
-            val f = File(path)
-            if (path.isEmpty() || !f.exists() || !f.isFile || f.length() <= 0L) {
-                return null
-            }
-            resolvedFsPath = path
-            fileName = f.name
-            reportedSize = f.length()
-        } else if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
-            try {
-                resolver.query(uri, null, null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (nameIdx != -1 && !cursor.isNull(nameIdx)) {
-                            fileName = cursor.getString(nameIdx) ?: ""
-                        }
-                        val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                        if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
-                            reportedSize = cursor.getLong(sizeIdx)
-                        }
-                        val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                        if (dataIdx != -1 && !cursor.isNull(dataIdx)) {
-                            val candidate = cursor.getString(dataIdx) ?: ""
-                            if (candidate.isNotEmpty() && File(candidate).exists()) {
-                                resolvedFsPath = candidate
+        try {
+            // 1. Resolve metadata from direct file path or content URI
+            if (resolvedFsPath.isNotEmpty()) {
+                val f = File(resolvedFsPath)
+                if (!f.exists() || !f.isFile || f.length() <= 0L) {
+                    return null
+                }
+                fileName = f.name
+                reportedSize = f.length()
+            } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
+                val path = uri.path ?: ""
+                val f = File(path)
+                if (path.isEmpty() || !f.exists() || !f.isFile || f.length() <= 0L) {
+                    return null
+                }
+                resolvedFsPath = path
+                fileName = f.name
+                reportedSize = f.length()
+            } else if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+                try {
+                    resolver.query(uri, null, null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx != -1 && !cursor.isNull(nameIdx)) {
+                                fileName = cursor.getString(nameIdx) ?: ""
+                            }
+                            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
+                                reportedSize = cursor.getLong(sizeIdx)
+                            }
+                            val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                            if (dataIdx != -1 && !cursor.isNull(dataIdx)) {
+                                val candidate = cursor.getString(dataIdx) ?: ""
+                                if (candidate.isNotEmpty() && File(candidate).exists()) {
+                                    resolvedFsPath = candidate
+                                }
                             }
                         }
                     }
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        // 2. Resolve real filesystem path via DocumentsContract / MediaStore
-        if (resolvedFsPath.isEmpty() || !File(resolvedFsPath).exists()) {
-            val resolved = resolveRealPathAndId(uri, fileName, reportedSize)
-            if (resolved.first != null) {
-                resolvedFsPath = resolved.first!!
-            }
-            if (resolved.second != null) {
-                mediaStoreId = resolved.second
-            }
-        }
-
-        // Prevent concurrent workers or duplicate URIs from importing the same source file twice
-        if (resolvedFsPath.isNotEmpty()) {
-            if (alreadyImportedPathsInBatch != null && !alreadyImportedPathsInBatch.add(resolvedFsPath)) {
-                return null
-            }
-        }
-
-        if (fileName.isEmpty() && resolvedFsPath.isNotEmpty()) {
-            fileName = File(resolvedFsPath).name
-        }
-
-        val detectedExt = fileName.substringAfterLast('.', "").lowercase(Locale.US)
-        if (mimeType.isBlank() ||
-            mimeType == "application/octet-stream" ||
-            mimeType == "*/*" ||
-            mimeType.endsWith("/*")
-        ) {
-            mimeType = guessMimeTypeFromExtension(fileName, mimeType)
-        } else if (detectedExt in ALL_SUPPORTED_EXTENSIONS) {
-            val extMime = guessMimeTypeFromExtension(fileName, mimeType)
-            if (extMime.isNotBlank()) {
-                mimeType = extMime
-            }
-        }
-
-        if (fileName.isEmpty()) {
-            val ext = extensionFromMimeType(mimeType)
-            fileName = "Media_${System.currentTimeMillis()}$ext"
-        }
-
-        // 3. Extract video duration before encrypting
-        var durationMs = 0L
-        if (mimeType.startsWith("video") || isVideoExtension(fileName)) {
-            val retriever = MediaMetadataRetriever()
-            try {
-                if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
-                    retriever.setDataSource(resolvedFsPath)
-                } else {
-                    retriever.setDataSource(context, uri)
-                }
-                val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                durationMs = durStr?.toLongOrNull() ?: 0L
-            } catch (_: Throwable) {
-            } finally {
-                try {
-                    retriever.release()
                 } catch (_: Throwable) {
                 }
             }
-        }
 
-        val blobName = "${UUID.randomUUID()}.bin"
-        val blobFile = File(vaultBlobsDir, blobName)
-        val thumbFile = File(vaultThumbsDir, "$blobName.thumb")
-        val baseIv = CryptoEngine.generateRandomBytes(16)
-
-        var rawInputStream: InputStream? = null
-        var totalWritten = 0L
-
-        try {
-            rawInputStream = if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
-                FileInputStream(File(resolvedFsPath))
-            } else {
-                resolver.openInputStream(uri)
+            // 2. Resolve real filesystem path via DocumentsContract / MediaStore
+            if (resolvedFsPath.isEmpty() || !File(resolvedFsPath).exists()) {
+                val resolved = resolveRealPathAndId(uri, fileName, reportedSize)
+                if (resolved.first != null) {
+                    resolvedFsPath = resolved.first!!
+                }
+                if (resolved.second != null) {
+                    mediaStoreId = resolved.second
+                }
             }
 
-            if (rawInputStream == null) {
+            // Deduplicate only by exact canonical source path or unique URI string when path is unavailable
+            val dedupKey = if (resolvedFsPath.isNotEmpty()) resolvedFsPath else uri.toString()
+            if (alreadyImportedPathsInBatch != null && !alreadyImportedPathsInBatch.add(dedupKey)) {
                 return null
             }
 
-            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(baseIv))
+            if (fileName.isEmpty() && resolvedFsPath.isNotEmpty()) {
+                fileName = File(resolvedFsPath).name
+            }
 
-            // Hotfix #2: High-throughput 4MB buffered streaming
-            BufferedInputStream(rawInputStream, IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
-                FileOutputStream(blobFile).use { fos ->
-                    BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
-                        CipherOutputStream(bufferedOut, cipher).use { cipherOut ->
-                            val buffer = ByteArray(IO_CHUNK_BUFFER_BYTES)
-                            var read: Int
-                            while (bufferedIn.read(buffer).also { read = it } != -1) {
-                                cipherOut.write(buffer, 0, read)
-                                totalWritten += read
-                            }
-                            cipherOut.flush()
-                        }
-                        bufferedOut.flush()
+            val detectedExt = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+            if (mimeType.isBlank() ||
+                mimeType == "application/octet-stream" ||
+                mimeType == "*/*" ||
+                mimeType.endsWith("/*")
+            ) {
+                mimeType = guessMimeTypeFromExtension(fileName, mimeType)
+            } else if (detectedExt in ALL_SUPPORTED_EXTENSIONS) {
+                val extMime = guessMimeTypeFromExtension(fileName, mimeType)
+                if (extMime.isNotBlank()) {
+                    mimeType = extMime
+                }
+            }
+
+            if (fileName.isEmpty()) {
+                val ext = extensionFromMimeType(mimeType)
+                fileName = "Media_${System.currentTimeMillis()}$ext"
+            }
+
+            // 3. Extract video duration before encrypting
+            var durationMs = 0L
+            if (mimeType.startsWith("video") || isVideoExtension(fileName)) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                        retriever.setDataSource(resolvedFsPath)
+                    } else {
+                        retriever.setDataSource(context, uri)
+                    }
+                    val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    durationMs = durStr?.toLongOrNull() ?: 0L
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        retriever.release()
+                    } catch (_: Throwable) {
                     }
                 }
             }
 
-            if (!blobFile.exists() || blobFile.length() <= 0L) {
-                blobFile.delete()
-                return null
-            }
+            val blobName = "${UUID.randomUUID()}.bin"
+            val tempBlobFile = File(vaultBlobsDir, ".tmp_$blobName")
+            val blobFile = File(vaultBlobsDir, blobName)
+            val metaFile = File(vaultBlobsDir, "$blobName.meta")
+            val thumbFile = File(vaultThumbsDir, "$blobName.thumb")
+            // Deterministic 16-byte IV derived from masterKey + blobName so it is 100% recoverable even if sidecars are lost
+            val baseIv = CryptoEngine.deriveDeterministicIv(masterKey, blobName)
 
-            // Generate smart mid-video / image thumbnail safely
-            ThumbnailCacheManager.generateAndSaveSafeThumbnailDuringImport(
-                context = context,
-                sourceUri = uri,
-                resolvedFsPath = resolvedFsPath,
-                mimeType = mimeType,
-                thumbFile = thumbFile,
-                masterKey = masterKey
-            )
+            var rawInputStream: InputStream? = null
+            var totalWritten = 0L
 
-            val finalOriginalPath = if (resolvedFsPath.isNotEmpty()) {
-                resolvedFsPath
-            } else {
-                val pictures = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                File(File(pictures, "Restored_Vault"), fileName).absolutePath
-            }
-
-            val item = VaultItem(
-                fileName = fileName,
-                originalPath = finalOriginalPath,
-                encryptedRelativePath = blobName,
-                mimeType = mimeType,
-                fileSize = if (totalWritten > 0L) totalWritten else reportedSize,
-                dateAdded = System.currentTimeMillis(),
-                folderId = targetFolderId,
-                isFavorite = false,
-                isDecoy = isDecoy,
-                durationMs = durationMs,
-                baseIvHex = toHex(baseIv)
-            )
-
-            val deletedPath = deleteOriginalFileSafely(
-                uri = uri,
-                fsPath = resolvedFsPath,
-                fileName = fileName,
-                reportedSize = item.fileSize,
-                mediaStoreId = mediaStoreId,
-                resolver = resolver,
-                runMediaScanImmediately = runMediaScanImmediately
-            )
-
-            return ImportWorkerResult(item = item, deletedSourcePath = deletedPath)
-        } catch (_: Throwable) {
-            blobFile.delete()
-            thumbFile.delete()
-            return null
-        } finally {
             try {
-                rawInputStream?.close()
+                rawInputStream = if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                    FileInputStream(File(resolvedFsPath))
+                } else {
+                    resolver.openInputStream(uri)
+                }
+
+                if (rawInputStream == null) {
+                    return null
+                }
+
+                val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+                cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(baseIv))
+
+                // Step 1 & 2: Encrypt stream into tempBlobFile and flush + fd.sync() before closing
+                BufferedInputStream(rawInputStream, IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
+                    FileOutputStream(tempBlobFile).use { fos ->
+                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
+                            CipherOutputStream(bufferedOut, cipher).use { cipherOut ->
+                                val buffer = ByteArray(IO_CHUNK_BUFFER_BYTES)
+                                var read: Int
+                                while (bufferedIn.read(buffer).also { read = it } != -1) {
+                                    cipherOut.write(buffer, 0, read)
+                                    totalWritten += read
+                                }
+                                cipherOut.flush()
+                            }
+                            bufferedOut.flush()
+                        }
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
+                // Step 3: Verify tempBlobFile and atomically rename to blobFile
+                if (!tempBlobFile.exists() || tempBlobFile.length() != totalWritten || totalWritten <= 0L) {
+                    tempBlobFile.delete()
+                    return null
+                }
+
+                if (!tempBlobFile.renameTo(blobFile)) {
+                    tempBlobFile.copyTo(blobFile, overwrite = true)
+                    tempBlobFile.delete()
+                }
+
+                if (!blobFile.exists() || blobFile.length() != totalWritten || totalWritten <= 0L) {
+                    tempBlobFile.delete()
+                    blobFile.delete()
+                    return null
+                }
+
+                // Step 4: Generate smart mid-video (35%/50%/65%) or image thumbnail into thumbFile
+                ThumbnailCacheManager.generateAndSaveSafeThumbnailDuringImport(
+                    context = context,
+                    sourceUri = uri,
+                    resolvedFsPath = resolvedFsPath,
+                    mimeType = mimeType,
+                    thumbFile = thumbFile,
+                    masterKey = masterKey
+                )
+
+                val finalOriginalPath = if (resolvedFsPath.isNotEmpty()) {
+                    resolvedFsPath
+                } else {
+                    val pictures = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                    File(File(pictures, "Restored_Vault"), fileName).absolutePath
+                }
+
+                // Step 5 & 6: Inside withContext(NonCancellable), commit DB row + .bin.meta sidecar,
+                // verify both exist on disk, and ONLY THEN delete the original source file!
+                return withContext(NonCancellable) {
+                    val item = VaultItem(
+                        fileName = fileName,
+                        originalPath = finalOriginalPath,
+                        encryptedRelativePath = blobName,
+                        mimeType = mimeType,
+                        fileSize = totalWritten,
+                        dateAdded = System.currentTimeMillis(),
+                        folderId = targetFolderId,
+                        isFavorite = false,
+                        isDecoy = isDecoy,
+                        durationMs = durationMs,
+                        baseIvHex = toHex(baseIv)
+                    )
+
+                    val insertedId = vaultDao.insertItem(item)
+                    val savedItem = item.copy(id = insertedId)
+                    writeSidecarMetadata(savedItem, masterKey)
+
+                    val verifiedDbRow = insertedId > 0L && vaultDao.getItemByEncryptedPath(blobName) != null
+                    val verifiedMetaOnDisk = metaFile.exists() && metaFile.length() > 0L
+                    val verifiedBlobOnDisk = blobFile.exists() && blobFile.length() == totalWritten && totalWritten > 0L
+
+                    if (!verifiedDbRow || !verifiedMetaOnDisk || !verifiedBlobOnDisk) {
+                        // Rollback encrypted artifacts and NEVER delete user's original file
+                        if (insertedId > 0L) {
+                            try {
+                                vaultDao.deleteItem(savedItem)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                        tempBlobFile.delete()
+                        blobFile.delete()
+                        metaFile.delete()
+                        thumbFile.delete()
+                        return@withContext null
+                    }
+
+                    val deletedPath = deleteOriginalFileSafely(
+                        uri = uri,
+                        fsPath = resolvedFsPath,
+                        fileName = savedItem.fileName,
+                        reportedSize = savedItem.fileSize,
+                        mediaStoreId = mediaStoreId,
+                        resolver = resolver,
+                        runMediaScanImmediately = false
+                    )
+                    if (deletedPath != null) {
+                        deletedPathsOut?.add(deletedPath)
+                    }
+
+                    savedItem
+                }
             } catch (_: Throwable) {
+                tempBlobFile.delete()
+                blobFile.delete()
+                metaFile.delete()
+                thumbFile.delete()
+                return null
+            } finally {
+                try {
+                    rawInputStream?.close()
+                } catch (_: Throwable) {
+                }
             }
+        } catch (_: Throwable) {
+            return null
         }
     }
 
@@ -1136,7 +2326,14 @@ class VaultStorage(private val context: Context) {
                 put("baseIvHex", item.baseIvHex)
             }
             val encryptedBytes = CryptoEngine.encryptAesGcm(json.toString().toByteArray(Charsets.UTF_8), masterKey)
-            metaFile.writeBytes(encryptedBytes)
+            FileOutputStream(metaFile).use { fos ->
+                fos.write(encryptedBytes)
+                fos.flush()
+                try {
+                    fos.fd.sync()
+                } catch (_: Throwable) {
+                }
+            }
         } catch (_: Exception) {
         }
     }
@@ -1231,101 +2428,11 @@ class VaultStorage(private val context: Context) {
 
     /**
      * Reconstructs any missing `FolderItem` or `VaultItem` rows in `VaultDatabase` from
-     * `vault_catalog.enc` and `.meta` sidecar files, then runs physical file reconciliation
-     * inside `VaultRepository.vaultMutex` so zero ghost or duplicate entries can exist.
+     * `vault_catalog.enc`, `.meta` sidecar files, AND any unindexed/orphaned physical files on disk
+     * inside `VaultRepository.vaultMutex` so all 70+ physical files are always visible.
      */
-    suspend fun reconcileAndRecoverCatalog(masterKey: SecretKey) = VaultRepository.withVaultLock {
-        try {
-            // First clean up any ghost or duplicate DB rows
-            val validExistingItems = reconcilePhysicalFilesLocked(masterKey = null)
-            val existingBlobNames = validExistingItems.map { it.encryptedRelativePath }.toMutableSet()
-            val existingFolders = folderDao.getAllFoldersSync()
-            val existingFolderIds = existingFolders.map { it.id }.toMutableSet()
-
-            // 1. Recover from vault_catalog.enc if present
-            if (catalogFile.exists() && catalogFile.length() > 0L) {
-                try {
-                    val decrypted = CryptoEngine.decryptAesGcm(catalogFile.readBytes(), masterKey)
-                    val root = JSONObject(String(decrypted, Charsets.UTF_8))
-                    val foldersArr = root.optJSONArray("folders")
-                    if (foldersArr != null) {
-                        for (i in 0 until foldersArr.length()) {
-                            val fObj = foldersArr.getJSONObject(i)
-                            val fId = fObj.optLong("id", 0L)
-                            if (fId !in existingFolderIds) {
-                                folderDao.insertFolder(
-                                    FolderItem(
-                                        id = fId,
-                                        folderName = fObj.getString("folderName"),
-                                        isLocked = fObj.optBoolean("isLocked", false),
-                                        lockType = fObj.optString("lockType", "MAIN_PIN"),
-                                        customPinSaltHex = fObj.optString("customPinSaltHex", "").ifEmpty { null },
-                                        customPinSlotAHex = fObj.optString("customPinSlotAHex", "").ifEmpty { null },
-                                        isDecoy = fObj.optBoolean("isDecoy", false)
-                                    )
-                                )
-                                existingFolderIds.add(fId)
-                            }
-                        }
-                    }
-
-                    val itemsArr = root.optJSONArray("items")
-                    if (itemsArr != null) {
-                        for (i in 0 until itemsArr.length()) {
-                            val obj = itemsArr.getJSONObject(i)
-                            val relPath = obj.getString("encryptedRelativePath")
-                            val blobFile = File(vaultBlobsDir, relPath)
-                            if (relPath.isNotBlank() && relPath !in existingBlobNames && blobFile.exists() && blobFile.length() > 0L) {
-                                val rawFolderId = obj.optLong("folderId", -1L)
-                                val recovered = VaultItem(
-                                    id = 0L, // Let Room auto-generate or replace by unique index on encryptedRelativePath
-                                    fileName = obj.getString("fileName"),
-                                    originalPath = obj.optString("originalPath", ""),
-                                    encryptedRelativePath = relPath,
-                                    mimeType = obj.optString("mimeType", "image/jpeg"),
-                                    fileSize = obj.optLong("fileSize", blobFile.length()),
-                                    dateAdded = obj.optLong("dateAdded", System.currentTimeMillis()),
-                                    folderId = if (rawFolderId == -1L) null else rawFolderId,
-                                    isFavorite = obj.optBoolean("isFavorite", false),
-                                    isDecoy = obj.optBoolean("isDecoy", false),
-                                    durationMs = obj.optLong("durationMs", 0L),
-                                    baseIvHex = obj.getString("baseIvHex")
-                                )
-                                vaultDao.insertItem(recovered)
-                                existingBlobNames.add(relPath)
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
-
-            // 2. Scan blobs directory for any .meta sidecar files not yet in the database
-            vaultBlobsDir.listFiles()?.forEach { file ->
-                if (file.name.endsWith(".bin.meta")) {
-                    val blobName = file.name.removeSuffix(".meta")
-                    val blobFile = File(vaultBlobsDir, blobName)
-                    if (blobName !in existingBlobNames && blobFile.exists() && blobFile.length() > 0L) {
-                        val recovered = readSidecarMetadata(file, masterKey)
-                        if (recovered != null) {
-                            vaultDao.insertItem(recovered.copy(id = 0L))
-                            existingBlobNames.add(blobName)
-                        }
-                    }
-                }
-            }
-
-            // 3. Final physical truth check & sidecar sync
-            val finalItems = reconcilePhysicalFilesLocked(masterKey = null)
-            finalItems.forEach { item ->
-                val metaFile = File(vaultBlobsDir, "${item.encryptedRelativePath}.meta")
-                if (!metaFile.exists()) {
-                    writeSidecarMetadata(item, masterKey)
-                }
-            }
-            syncEncryptedCatalogLocked(masterKey)
-        } catch (_: Exception) {
-        }
+    suspend fun reconcileAndRecoverCatalog(masterKey: SecretKey, isDecoy: Boolean = false) = VaultRepository.withVaultLock {
+        recoverOrphanedVaultFilesLocked(masterKey = masterKey, isDecoy = isDecoy, showProgress = false)
     }
 
     private fun resolveRealPathAndId(uri: Uri, fileName: String, reportedSize: Long): Pair<String?, Long?> {
@@ -1656,7 +2763,7 @@ class VaultStorage(private val context: Context) {
         reservedTargetPaths: MutableSet<String>?
     ): UnhideWorkerResult? {
         val blobFile = File(vaultBlobsDir, item.encryptedRelativePath)
-        if (!blobFile.exists()) return null
+        if (!blobFile.exists() || blobFile.length() <= 0L) return null
 
         val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         val defaultRestoredDir = File(picturesDir, "Restored_Vault")
@@ -1669,14 +2776,57 @@ class VaultStorage(private val context: Context) {
         )
 
         return try {
-            BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
-                FileOutputStream(targetFile).use { fos ->
-                    BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
-                        val baseIv = fromHex(item.baseIvHex)
-                        CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, baseIv)
-                        bufferedOut.flush()
+            // Inspect first 64 bytes to choose the best IV (stored baseIvHex vs deterministicIv vs raw unencrypted)
+            val headerSample = ByteArray(64)
+            var headerLen = 0
+            try {
+                FileInputStream(blobFile).use { fis ->
+                    headerLen = fis.read(headerSample)
+                }
+            } catch (_: Throwable) {
+            }
+            val actualHeader = if (headerLen > 0) headerSample.copyOfRange(0, headerLen) else ByteArray(0)
+
+            val rawSig = CryptoEngine.detectMediaSignature(actualHeader)
+            if (rawSig != null) {
+                // Physical file is already raw unencrypted media; copy directly to targetFile
+                BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
+                    FileOutputStream(targetFile).use { fos ->
+                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                            val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
+                            var r: Int
+                            while (bis.read(buf).also { r = it } != -1) {
+                                bos.write(buf, 0, r)
+                            }
+                            bos.flush()
+                        }
                     }
                 }
+            } else {
+                val storedIv = fromHex(item.baseIvHex).let { if (it.size == 16) it else CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath) }
+                val detIv = CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
+                val zeroIv = ByteArray(16)
+
+                val effectiveIv = when {
+                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, storedIv)) != null -> storedIv
+                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, detIv)) != null -> detIv
+                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, zeroIv)) != null -> zeroIv
+                    else -> storedIv
+                }
+
+                BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
+                    FileOutputStream(targetFile).use { fos ->
+                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
+                            CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, effectiveIv)
+                            bufferedOut.flush()
+                        }
+                    }
+                }
+            }
+
+            if (!targetFile.exists() || targetFile.length() <= 0L) {
+                targetFile.delete()
+                return null
             }
 
             blobFile.delete()
@@ -1736,21 +2886,21 @@ class VaultStorage(private val context: Context) {
     }
 
     /**
-     * Point 3: Fix 12GB+ Backup (.lvb) Exporting as Empty/Tiny KB-MB File.
-     * 1. True Buffered Streaming Architecture (Zero RAM Bloat):
-     *    Opens destination URI via `contentResolver.openFileDescriptor(destUri, "w")` and wraps
-     *    `FileOutputStream(pfd.fileDescriptor)` inside `BufferedOutputStream(fos, 262_144)` -> `ZipOutputStream(bos)`
-     *    with `zipOut.setLevel(Deflater.NO_COMPRESSION)` (encrypted files are uncompressible; 5x faster).
-     * 2. Complete Vault Traversal & Chunked 256KB Copy Loop:
-     *    Streams `vault_manifest.json` AND every encrypted media `.bin` file, `.meta` sidecar, and
-     *    `.thumb` file across `vaultBlobsDir` and `vaultThumbsDir`, updating live byte progress.
-     * 3. Proper Stream Finalization:
-     *    Calls `zipOut.finish()`, `zipOut.flush()`, `bos.flush()`, and `fos.fd.sync()` before closing.
+     * Requirement 3: Physical-Scan Offline Backup (.lvb) Export:
+     * 1. Scans physical vault folders (`recoverOrphanedVaultFilesLocked` + `vaultBlobsDir.listFiles()`)
+     *    so even if a file was missing from the JSON/Room index, it is recovered, included in
+     *    `vault_manifest.json`, and exported into the `.lvb` archive without losing a single file.
+     * 2. Uses buffered `ZipOutputStream` (`Deflater.NO_COMPRESSION`) and `fos.fd.sync()`.
      */
-    suspend fun exportEncryptedBackup(destUri: Uri, headerFile: File): Result<Int> = VaultRepository.withVaultLock {
+    suspend fun exportEncryptedBackup(
+        destUri: Uri,
+        headerFile: File,
+        masterKey: SecretKey? = null
+    ): Result<Int> = VaultRepository.withVaultLock {
         try {
-            // Reconcile physical files first so the backup manifest has zero ghost or duplicate items
-            val validItemsList = reconcilePhysicalFilesLocked(masterKey = null)
+            // Recover any physical orphaned files on disk before building the backup manifest
+            recoverOrphanedVaultFilesLocked(masterKey = masterKey, isDecoy = false, showProgress = false)
+            val validItemsList = reconcilePhysicalFilesLocked(masterKey = masterKey)
             val allFolders = folderDao.getAllFoldersSync()
             val headerText = if (headerFile.exists()) headerFile.readText(Charsets.UTF_8) else "{}"
 
@@ -1775,23 +2925,47 @@ class VaultStorage(private val context: Context) {
                 val blob = File(vaultBlobsDir, item.encryptedRelativePath)
                 if (blob.exists() && blob.length() > 0L && !uniqueItemsByPath.containsKey(item.encryptedRelativePath)) {
                     uniqueItemsByPath[item.encryptedRelativePath] = item
-                    itemsJson.put(
-                        JSONObject().apply {
-                            put("id", item.id)
-                            put("fileName", item.fileName)
-                            put("originalPath", item.originalPath)
-                            put("encryptedRelativePath", item.encryptedRelativePath)
-                            put("mimeType", item.mimeType)
-                            put("fileSize", item.fileSize)
-                            put("dateAdded", item.dateAdded)
-                            put("folderId", item.folderId ?: -1L)
-                            put("isFavorite", item.isFavorite)
-                            put("isDecoy", item.isDecoy)
-                            put("durationMs", item.durationMs)
-                            put("baseIvHex", item.baseIvHex)
-                        }
-                    )
                 }
+            }
+
+            // Also scan vaultBlobsDir directly so any physical .bin file on disk is guaranteed to be in itemsJson
+            var fallbackSeq = uniqueItemsByPath.size + 1
+            vaultBlobsDir.listFiles()?.forEach { file ->
+                if (file.isFile &&
+                    file.length() > 0L &&
+                    !file.name.endsWith(".meta") &&
+                    !file.name.endsWith(".thumb") &&
+                    !file.name.startsWith(".tmp_") &&
+                    !uniqueItemsByPath.containsKey(file.name)
+                ) {
+                    val reconstructed = reconstructVaultItemFromPhysicalFile(
+                        blobFile = file,
+                        subfolderId = null,
+                        sequenceIndex = fallbackSeq++,
+                        masterKey = masterKey,
+                        isDecoy = false
+                    )
+                    uniqueItemsByPath[file.name] = reconstructed
+                }
+            }
+
+            uniqueItemsByPath.values.forEach { item ->
+                itemsJson.put(
+                    JSONObject().apply {
+                        put("id", item.id)
+                        put("fileName", item.fileName)
+                        put("originalPath", item.originalPath)
+                        put("encryptedRelativePath", item.encryptedRelativePath)
+                        put("mimeType", item.mimeType)
+                        put("fileSize", item.fileSize)
+                        put("dateAdded", item.dateAdded)
+                        put("folderId", item.folderId ?: -1L)
+                        put("isFavorite", item.isFavorite)
+                        put("isDecoy", item.isDecoy)
+                        put("durationMs", item.durationMs)
+                        put("baseIvHex", item.baseIvHex)
+                    }
+                )
             }
 
             // Collect all physical encrypted media files, sidecar metadata, and thumbnails across vault directories
@@ -2113,18 +3287,20 @@ class VaultStorage(private val context: Context) {
                     }
                 }
 
-                reconcilePhysicalFilesLocked(masterKey = null)
+                // Also recover any extracted physical .bin files that were not listed in vault_manifest.json
+                val report = recoverOrphanedVaultFilesLocked(masterKey = null, isDecoy = false, showProgress = false)
+                val finalCount = maxOf(restoredItemsCount, report.totalVaultFilesOnDisk)
 
                 VaultRepository.updateProgress(
                     title = "Restoring Backup...",
-                    currentItem = restoredItemsCount,
-                    totalItems = restoredItemsCount,
+                    currentItem = finalCount,
+                    totalItems = finalCount,
                     percentage = 100,
-                    subText = "$restoredItemsCount / $restoredItemsCount files",
+                    subText = "$finalCount / $finalCount files",
                     forceEmit = true
                 )
                 VaultRepository.hideProgress()
-                Result.success(restoredItemsCount)
+                Result.success(finalCount)
             }
         } catch (e: Throwable) {
             VaultRepository.hideProgress()

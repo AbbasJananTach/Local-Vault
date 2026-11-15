@@ -196,6 +196,7 @@ fun HomeScreen(
     onToggleFavoriteSelected: (List<VaultItem>) -> Unit,
     onMoveSelectedItemsToFolder: (List<VaultItem>, Long?) -> Unit,
     onOpenSettings: () -> Unit,
+    onRecoverMissingFiles: () -> Unit = {},
     onColumnCountChanged: (Int) -> Unit,
     usedStorageBytes: Long
 ) {
@@ -242,23 +243,19 @@ fun HomeScreen(
     var showUnhideSelectedConfirmDialog by remember { mutableStateOf(false) }
     var folderPendingConfirmDelete by remember { mutableStateOf<FolderItem?>(null) }
 
-    // Point 1 (Step 3 & 4): Physical File Reconciliation (Truth Check) & Strict De-duplication
+    // Automatic Orphaned File Recovery & Physical File Reconciliation on launch and tab/folder refresh
     LaunchedEffect(openedFolder?.id, currentTab) {
-        vaultStorage.reconcilePhysicalFiles(masterKey)
+        VaultRepository.recoverOrphanedVaultFiles(
+            context = context,
+            masterKey = masterKey,
+            isDecoy = isDecoyMode,
+            showProgress = false
+        )
     }
 
-    val deduplicatedItems = remember(items, vaultBlobsDir) {
-        val physicalNames = try {
-            vaultBlobsDir.listFiles()
-                ?.asSequence()
-                ?.filter { it.isFile && it.name.endsWith(".bin") && it.length() > 0L }
-                ?.map { it.name }
-                ?.toSet() ?: emptySet()
-        } catch (_: Exception) {
-            emptySet()
-        }
+    val deduplicatedItems = remember(items) {
         items
-            .filter { it.vaultFilePath.isNotBlank() && it.vaultFilePath in physicalNames }
+            .filter { it.vaultFilePath.isNotBlank() }
             .distinctBy { it.vaultFilePath }
     }
 
@@ -515,6 +512,26 @@ fun HomeScreen(
                                 )
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            onRecoverMissingFiles()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("drawer_recover_missing_files_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Search,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Scan & Recover Missing Files")
                     }
                 }
             }
@@ -969,32 +986,15 @@ fun HomeScreen(
                             }
                         }
                     } else {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Long-press any folder to Rename, Change PIN, or Delete",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                TextButton(
-                                    onClick = { showCreateFolderDialog = true },
-                                    modifier = Modifier.testTag("header_create_folder_button")
-                                ) {
-                                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("New Folder")
-                                }
-                            }
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.Top,
+                            horizontalAlignment = Alignment.Start
+                        ) {
                             LazyVerticalGrid(
                                 state = foldersGridState,
                                 columns = GridCells.Fixed(2),
-                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 88.dp),
+                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 88.dp),
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 verticalArrangement = Arrangement.spacedBy(12.dp),
                                 modifier = Modifier.fillMaxSize()
