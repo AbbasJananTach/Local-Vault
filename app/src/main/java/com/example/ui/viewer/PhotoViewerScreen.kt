@@ -84,6 +84,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.example.data.ThumbnailCacheManager
 import com.example.data.db.FolderItem
 import com.example.data.db.VaultItem
@@ -150,13 +153,33 @@ fun PhotoViewerScreen(
     var pendingPinActionTitle by remember { mutableStateOf<String?>(null) }
     var pendingPinActionCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
 
+    // FIX 4: Hide Android System Status Bar & Navigation Bar when controls are hidden (e.g., Slideshow)
+    val insetsController = remember(activity, currentView) {
+        activity?.window?.let { WindowCompat.getInsetsController(it, currentView) }
+    }
+    LaunchedEffect(insetsController, isControlsVisible) {
+        insetsController?.let { controller ->
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (isControlsVisible) {
+                controller.show(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
     // Point 28 (Step 2): Screen Wake Lock in Photo Viewer & Slideshow Mode so screen never turns off
-    DisposableEffect(currentView, isSlideshowActive) {
+    DisposableEffect(currentView, isSlideshowActive, insetsController) {
         activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         currentView.keepScreenOn = true
         onDispose {
             currentView.keepScreenOn = false
             activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            try {
+                insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            } catch (_: Throwable) {
+            }
         }
     }
 

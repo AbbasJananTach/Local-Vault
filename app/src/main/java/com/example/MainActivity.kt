@@ -737,41 +737,6 @@ class MainActivity : ComponentActivity() {
                                     masterKey = key,
                                     vaultBlobsDir = vaultStorage.vaultBlobsDir,
                                     playlistVideos = playlistVideos,
-                                    folders = folders,
-                                    onVerifyContextualPin = { folderId, inputPin ->
-                                        val targetFolder = folderId?.let { id -> folders.find { it.id == id } }
-                                        headerManager.verifyContextualPin(
-                                            folder = targetFolder,
-                                            inputPin = inputPin,
-                                            isDecoyMode = isDecoyVault
-                                        )
-                                    },
-                                    onUnhide = { item ->
-                                        scope.launch(Dispatchers.IO) {
-                                            val destFolder = vaultStorage.unhideFileWithDestination(item, key) ?: "/Pictures/Restored_Vault"
-                                            withContext(Dispatchers.Main) {
-                                                Toast.makeText(
-                                                    this@MainActivity,
-                                                    "Restored to $destFolder",
-                                                    Toast.LENGTH_LONG
-                                                ).show()
-                                                currentScreen.value = Screen.Home
-                                            }
-                                        }
-                                    },
-                                    onDelete = { item ->
-                                        scope.launch(Dispatchers.IO) {
-                                            vaultStorage.deletePermanently(item, key)
-                                            withContext(Dispatchers.Main) {
-                                                Toast.makeText(
-                                                    this@MainActivity,
-                                                    "Deleted '${item.fileName}'",
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
-                                                currentScreen.value = Screen.Home
-                                            }
-                                        }
-                                    },
                                     onBack = { currentScreen.value = Screen.Home }
                                 )
                             }
@@ -1155,10 +1120,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Point 6: Instant Complete App Exit on Power Button / Screen Off.
+     * FIX 5: Instant Complete App Exit on Power Button / Screen Off.
      * Stops and releases any active video player, clears all unlocked vault/folder states in memory,
-     * and executes `finishAffinity()` followed by `finishAndRemoveTask()` so the app completely
-     * closes and disappears from Android's Recent Apps (Overview).
+     * marks all AppTasks excluded from Recents, and invokes `finishAndRemoveTask()` directly
+     * without calling `finishAffinity()` beforehand.
      */
     private fun exitAndRemoveTaskOnScreenOff() {
         VaultRepository.stopAndReleaseActivePlayerAndClearSession()
@@ -1166,12 +1131,27 @@ class MainActivity : ComponentActivity() {
         isDecoyVault = false
         currentScreen.value = Screen.Auth
         try {
-            finishAffinity()
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            am?.appTasks?.forEach { task ->
+                try {
+                    task.setExcludeFromRecents(true)
+                } catch (_: Throwable) {
+                }
+                try {
+                    task.finishAndRemoveTask()
+                } catch (_: Throwable) {
+                }
+            }
         } catch (_: Throwable) {
         }
         try {
+            // CRITICAL: Call finishAndRemoveTask() directly. Do NOT call finishAffinity() before it!
             finishAndRemoveTask()
         } catch (_: Throwable) {
+            try {
+                finish()
+            } catch (_: Throwable) {
+            }
         }
     }
 

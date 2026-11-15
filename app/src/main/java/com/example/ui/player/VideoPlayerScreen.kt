@@ -1,6 +1,5 @@
 package com.example.ui.player
 
-import android.app.Activity
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.media.AudioManager
@@ -10,12 +9,21 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,51 +34,53 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.BrightnessMedium
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FastRewind
+import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -84,22 +94,31 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -117,9 +136,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.data.ThumbnailCacheManager
 import com.example.data.VaultRepository
-import com.example.data.db.FolderItem
 import com.example.data.db.VaultItem
-import com.example.ui.components.CustomPinKeypadDialog
 import com.example.ui.util.findActivity
 import kotlinx.coroutines.delay
 import java.io.File
@@ -136,7 +153,7 @@ private enum class DragGestureMode {
 }
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-@kotlin.OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun VideoPlayerScreen(
     vaultItem: VaultItem,
@@ -145,20 +162,14 @@ fun VideoPlayerScreen(
     masterKey: SecretKey,
     vaultBlobsDir: File = blobFile.parentFile ?: blobFile,
     playlistVideos: List<VaultItem> = listOf(vaultItem),
-    folders: List<FolderItem> = emptyList(),
-    onVerifyContextualPin: (Long?, String) -> Boolean = { _, _ -> true },
-    onUnhide: (VaultItem) -> Unit = {},
-    onDelete: (VaultItem) -> Unit = {},
     onBack: () -> Unit
 ) {
-    BackHandler { onBack() }
     val context = LocalContext.current
     val currentView = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val activity = remember(context) { context.findActivity() }
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
 
-    // Supports switching videos inside the player via the "More Videos" YouTube-style thumbnail drawer (Point 26)
     var activeVideoItem by remember(vaultItem.id) { mutableStateOf(vaultItem) }
     val activeBlobFile = remember(activeVideoItem.id, activeVideoItem.encryptedRelativePath, vaultBlobsDir) {
         if (activeVideoItem.id == vaultItem.id) blobFile
@@ -177,8 +188,10 @@ fun VideoPlayerScreen(
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubPosition by remember { mutableLongStateOf(0L) }
 
-    // Point 23: Auto-Hide Top Bar & All Control Buttons after 3000ms (3 seconds)
+    // Controls visibility & Screen Touch Lock
     var areControlsVisible by remember { mutableStateOf(true) }
+    var isScreenLocked by remember { mutableStateOf(false) }
+    var showUnlockHint by remember { mutableStateOf(false) }
     var lastInteractionTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
     val registerInteraction: () -> Unit = {
@@ -190,36 +203,73 @@ fun VideoPlayerScreen(
     var showMoreVideosSheet by remember { mutableStateOf(false) }
     var isLandscapeMode by remember { mutableStateOf(false) }
     var videoResolutionLabel by remember { mutableStateOf<String?>(null) }
-    var showDeleteConfirmDialog by remember { mutableStateOf(false) }
-    var showUnhideConfirmDialog by remember { mutableStateOf(false) }
-    var pendingPinActionTitle by remember { mutableStateOf<String?>(null) }
-    var pendingPinActionCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var isRepeatOne by remember { mutableStateOf(false) }
+    var isMuted by remember { mutableStateOf(false) }
 
-    // Resize modes: RESIZE_MODE_FIT (0), RESIZE_MODE_ZOOM (4), RESIZE_MODE_FILL (3)
+    // Interactive Pinch-to-Zoom & Pan state (100% .. 400%)
+    var videoZoom by remember { mutableFloatStateOf(1.0f) }
+    var videoPanX by remember { mutableFloatStateOf(0f) }
+    var videoPanY by remember { mutableFloatStateOf(0f) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+
+    // Aspect ratios: FIT -> CROP/FILL -> STRETCH
     val resizeModes = remember {
         listOf(
-            AspectRatioFrameLayout.RESIZE_MODE_FIT to "Fit",
-            AspectRatioFrameLayout.RESIZE_MODE_ZOOM to "Zoom",
-            AspectRatioFrameLayout.RESIZE_MODE_FILL to "Stretch"
+            Triple(AspectRatioFrameLayout.RESIZE_MODE_FIT, "Fit", "Fit to Screen"),
+            Triple(AspectRatioFrameLayout.RESIZE_MODE_ZOOM, "Crop", "Crop / Fill"),
+            Triple(AspectRatioFrameLayout.RESIZE_MODE_FILL, "Stretch", "Stretch")
         )
     }
     var resizeIndex by remember { mutableIntStateOf(0) }
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
 
-    // Subtle HUD & Center 400ms Double-Tap Play/Pause Indicator (Point 24)
+    // Subtle HUD & Center 400ms Double-Tap Play/Pause Indicator
     var hudText by remember { mutableStateOf<String?>(null) }
     var hudIcon by remember { mutableStateOf<ImageVector?>(null) }
+    var hudTick by remember { mutableIntStateOf(0) }
     var centerDoubleTapIcon by remember { mutableStateOf<ImageVector?>(null) }
     var centerDoubleTapTick by remember { mutableIntStateOf(0) }
     var playerError by remember { mutableStateOf<String?>(null) }
 
-    // Drop shadow for crisp white text over bright video frames on 100% transparent overlays (Point 25)
+    // Back closes "More videos" overlay first before exiting VideoPlayerScreen
+    BackHandler {
+        if (showMoreVideosSheet) {
+            showMoreVideosSheet = false
+            registerInteraction()
+        } else {
+            onBack()
+        }
+    }
+
     val overlayTextShadow = remember {
         Shadow(
             color = Color.Black.copy(alpha = 0.85f),
             offset = Offset(0f, 1.5f),
             blurRadius = 6f
         )
+    }
+
+    val showHud: (ImageVector?, String) -> Unit = { icon, text ->
+        hudIcon = icon
+        hudText = text
+        hudTick++
+    }
+
+    val zoomSteps = remember { listOf(1.0f, 1.25f, 1.5f, 2.0f, 3.0f) }
+    val cycleZoomStep: () -> Unit = {
+        registerInteraction()
+        val nextZoom = zoomSteps.firstOrNull { it > videoZoom + 0.05f } ?: 1.0f
+        videoZoom = nextZoom
+        if (nextZoom <= 1.01f) {
+            videoPanX = 0f
+            videoPanY = 0f
+        } else {
+            val maxX = (containerSize.width * (nextZoom - 1f)) / 2f
+            val maxY = (containerSize.height * (nextZoom - 1f)) / 2f
+            videoPanX = videoPanX.coerceIn(-maxX, maxX)
+            videoPanY = videoPanY.coerceIn(-maxY, maxY)
+        }
+        showHud(Icons.Default.ZoomIn, "Zoom ${(nextZoom * 100f).roundToInt()}%")
     }
 
     val toggleOrientation: () -> Unit = {
@@ -234,12 +284,29 @@ fun VideoPlayerScreen(
             }
         } catch (_: Throwable) {
         }
-        hudIcon = Icons.Default.ScreenRotation
-        hudText = if (nextLandscape) "Landscape" else "Portrait"
+        showHud(Icons.Default.ScreenRotation, if (nextLandscape) "Landscape" else "Portrait")
     }
 
-    // Point 21 (Layer 3) & Point 22 & Hotfix #1: Defensive ExoPlayer with DefaultRenderersFactory decoder fallback,
-    // C.WAKE_MODE_LOCAL, and DefaultExtractorsFactory constant-bitrate seeking.
+    // FIX 4: Hide Android System Status Bar (Wi-Fi/Battery/Clock) & Navigation Bar (Back/Home/Recents)
+    // whenever controls auto-hide or touch lock is active, and restore cleanly on exit.
+    val insetsController = remember(activity, currentView) {
+        activity?.window?.let { WindowCompat.getInsetsController(it, currentView) }
+    }
+    LaunchedEffect(insetsController, areControlsVisible, isScreenLocked, showMoreVideosSheet) {
+        insetsController?.let { controller ->
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            val shouldShowBars = (areControlsVisible && !isScreenLocked) || showMoreVideosSheet
+            if (shouldShowBars) {
+                controller.show(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    // Defensive ExoPlayer with DefaultRenderersFactory decoder fallback, WAKE_MODE_LOCAL,
+    // and DefaultExtractorsFactory constant-bitrate seeking.
     val exoPlayer = remember {
         val renderersFactory = DefaultRenderersFactory(context)
             .setEnableDecoderFallback(true)
@@ -281,7 +348,7 @@ fun VideoPlayerScreen(
                 }
 
                 override fun onPlaybackStateChanged(state: Int) {
-                    if (state == Player.STATE_ENDED) {
+                    if (state == Player.STATE_ENDED && repeatMode == Player.REPEAT_MODE_OFF) {
                         isPlaying = false
                         areControlsVisible = true
                     }
@@ -290,11 +357,14 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Hotfix #1: Defensively load/switch decrypted streaming MediaSource inside try-catch
+    // Load or switch encrypted video stream safely
     LaunchedEffect(activeVideoItem.id, activeBlobFile, activeBaseIv) {
         playerError = null
         currentPosition = 0L
         duration = activeVideoItem.durationMs.coerceAtLeast(0L)
+        videoZoom = 1.0f
+        videoPanX = 0f
+        videoPanY = 0f
 
         try {
             val dataSourceFactory = DataSource.Factory {
@@ -316,10 +386,14 @@ fun VideoPlayerScreen(
 
             exoPlayer.setMediaSource(mediaSource)
             exoPlayer.setPlaybackSpeed(playbackSpeed)
+            exoPlayer.repeatMode = if (isRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+            exoPlayer.volume = if (isMuted) 0f else 1f
             exoPlayer.prepare()
             exoPlayer.playWhenReady = true
             isPlaying = true
-            areControlsVisible = true
+            if (!isScreenLocked) {
+                areControlsVisible = true
+            }
             lastInteractionTime = System.currentTimeMillis()
         } catch (t: Throwable) {
             playerError = t.localizedMessage ?: "Unable to initialize video player"
@@ -327,9 +401,9 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Point 21 & Hotfix #1: Keep screen awake during playback + restore orientation/brightness safely on dispose.
-    // Ignores transient config-change lifecycle pauses while rotating so playback & vault session never reset!
-    DisposableEffect(lifecycleOwner, exoPlayer, currentView) {
+    // FIX 5: Removed duplicate local screenOffReceiver & finishAffinity() from VideoPlayerScreen.
+    // MainActivity handles ACTION_SCREEN_OFF -> exitAndRemoveTaskOnScreenOff() centrally.
+    DisposableEffect(lifecycleOwner, exoPlayer, currentView, insetsController) {
         VaultRepository.registerActivePlayer(exoPlayer)
         try {
             activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -337,77 +411,31 @@ fun VideoPlayerScreen(
         }
         currentView.keepScreenOn = true
 
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-        val screenOffReceiver = object : android.content.BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: android.content.Intent?) {
-                if (intent?.action == android.content.Intent.ACTION_SCREEN_OFF) {
-                    try {
-                        exoPlayer.stop()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        exoPlayer.release()
-                    } catch (_: Throwable) {
-                    }
-                    VaultRepository.stopAndReleaseActivePlayerAndClearSession()
-                    try {
-                        activity?.finishAffinity()
-                        activity?.finishAndRemoveTask()
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
-        }
-        try {
-            context.registerReceiver(
-                screenOffReceiver,
-                android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
-            )
-        } catch (_: Throwable) {
-        }
-
         val observer = LifecycleEventObserver { _, event ->
             if (activity?.isChangingConfigurations == true) {
                 return@LifecycleEventObserver
             }
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
-                val isScreenOff = powerManager != null && !powerManager.isInteractive
-                if (isScreenOff) {
-                    try {
-                        exoPlayer.stop()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        exoPlayer.release()
-                    } catch (_: Throwable) {
-                    }
-                    VaultRepository.stopAndReleaseActivePlayerAndClearSession()
-                    try {
-                        activity?.finishAffinity()
-                        activity?.finishAndRemoveTask()
-                    } catch (_: Throwable) {
-                    }
-                } else {
-                    try {
-                        exoPlayer.pause()
-                    } catch (_: Throwable) {
-                    }
-                    isPlaying = false
+                try {
+                    exoPlayer.pause()
+                } catch (_: Throwable) {
                 }
+                isPlaying = false
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
 
         onDispose {
-            try {
-                context.unregisterReceiver(screenOffReceiver)
-            } catch (_: Throwable) {
-            }
             VaultRepository.unregisterActivePlayer(exoPlayer)
 
             currentView.keepScreenOn = false
             try {
                 activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } catch (_: Throwable) {
+            }
+
+            try {
+                insetsController?.show(WindowInsetsCompat.Type.systemBars())
             } catch (_: Throwable) {
             }
 
@@ -450,15 +478,23 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Point 23: Auto-hide ALL controls after 3000ms (3 seconds) when playing
-    LaunchedEffect(areControlsVisible, isPlaying, lastInteractionTime, isScrubbing, showSpeedMenu, showMoreVideosSheet) {
-        if (areControlsVisible && isPlaying && !isScrubbing && !showSpeedMenu && !showMoreVideosSheet) {
+    // Auto-hide ALL controls + system bars after 3000ms (3 seconds) when playing
+    LaunchedEffect(areControlsVisible, isPlaying, lastInteractionTime, isScrubbing, showSpeedMenu, showMoreVideosSheet, isScreenLocked) {
+        if (areControlsVisible && isPlaying && !isScrubbing && !showSpeedMenu && !showMoreVideosSheet && !isScreenLocked) {
             delay(3000L)
             areControlsVisible = false
         }
     }
 
-    // Point 24: Brief 400ms center play/pause indicator on center double-tap
+    // Auto-hide "Tap to Unlock" lock button after 2.5s when screen touch lock is active
+    LaunchedEffect(showUnlockHint, isScreenLocked) {
+        if (showUnlockHint && isScreenLocked) {
+            delay(2500L)
+            showUnlockHint = false
+        }
+    }
+
+    // Brief 400ms center play/pause indicator on center double-tap
     LaunchedEffect(centerDoubleTapTick) {
         if (centerDoubleTapIcon != null) {
             delay(400L)
@@ -467,9 +503,9 @@ fun VideoPlayerScreen(
     }
 
     // Clear HUD after short delay
-    LaunchedEffect(hudText) {
+    LaunchedEffect(hudTick) {
         if (hudText != null) {
-            delay(850L)
+            delay(900L)
             hudText = null
             hudIcon = null
         }
@@ -482,36 +518,90 @@ fun VideoPlayerScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(Unit) {
-                    // Point 23 & Point 24:
-                    // - Single-Tap anywhere toggles areControlsVisible = !areControlsVisible
-                    // - Double-Tap in the center 50% width toggles Play/Pause with a 400ms subtle fade-out icon
-                    // - Double-Tap on far left 25% seeks -10s; far right 25% seeks +10s
+                .clipToBounds()
+                .onSizeChanged { containerSize = it }
+                // Handler 1: Two-finger Pinch-to-Zoom (100%..400%) and Zoomed Pan
+                .pointerInput(isScreenLocked) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        if (isScreenLocked) return@awaitEachGesture
+                        var isMultiTouchOrZoomPan = false
+                        do {
+                            val event = awaitPointerEvent()
+                            val pressedCount = event.changes.count { it.pressed }
+                            if (pressedCount >= 2 || videoZoom > 1.01f) {
+                                val zoomChange = event.calculateZoom()
+                                val panChange = event.calculatePan()
+                                val shouldHandle = pressedCount >= 2 ||
+                                    (videoZoom > 1.01f && (abs(panChange.x) > 3f || abs(panChange.y) > 3f || isMultiTouchOrZoomPan))
+
+                                if (shouldHandle) {
+                                    isMultiTouchOrZoomPan = true
+                                    val prevZoom = videoZoom
+                                    val nextZoom = if (pressedCount >= 2) {
+                                        (prevZoom * zoomChange).coerceIn(1.0f, 4.0f)
+                                    } else {
+                                        prevZoom
+                                    }
+                                    val maxX = (containerSize.width * (nextZoom - 1f)) / 2f
+                                    val maxY = (containerSize.height * (nextZoom - 1f)) / 2f
+
+                                    if (nextZoom <= 1.01f) {
+                                        videoZoom = 1.0f
+                                        videoPanX = 0f
+                                        videoPanY = 0f
+                                    } else {
+                                        videoZoom = nextZoom
+                                        videoPanX = (videoPanX + panChange.x).coerceIn(-maxX, maxX)
+                                        videoPanY = (videoPanY + panChange.y).coerceIn(-maxY, maxY)
+                                    }
+
+                                    if (pressedCount >= 2 && abs(nextZoom - prevZoom) > 0.002f) {
+                                        showHud(Icons.Default.ZoomIn, "Zoom ${(nextZoom * 100f).roundToInt()}%")
+                                    }
+
+                                    event.changes.forEach { change ->
+                                        if (change.positionChanged()) {
+                                            change.consume()
+                                        }
+                                    }
+                                }
+                            }
+                        } while (event.changes.any { it.pressed })
+                    }
+                }
+                // Handler 2: Single-Tap controls toggle & Double-Tap (-10s / Play-Pause / +10s)
+                .pointerInput(isScreenLocked) {
                     detectTapGestures(
                         onTap = {
-                            areControlsVisible = !areControlsVisible
-                            lastInteractionTime = System.currentTimeMillis()
+                            if (isScreenLocked) {
+                                showUnlockHint = !showUnlockHint
+                            } else {
+                                areControlsVisible = !areControlsVisible
+                                registerInteraction()
+                            }
                         },
                         onDoubleTap = { offset ->
+                            if (isScreenLocked) {
+                                showUnlockHint = true
+                                return@detectTapGestures
+                            }
                             val width = size.width.toFloat().coerceAtLeast(1f)
-                            lastInteractionTime = System.currentTimeMillis()
+                            registerInteraction()
                             when {
                                 offset.x < width * 0.25f -> {
                                     val newPos = maxOf(0L, exoPlayer.currentPosition - 10_000L)
                                     exoPlayer.seekTo(newPos)
                                     currentPosition = newPos
-                                    hudIcon = Icons.Default.FastRewind
-                                    hudText = "-10s"
+                                    showHud(Icons.Default.FastRewind, "-10s")
                                 }
                                 offset.x > width * 0.75f -> {
                                     val newPos = minOf(duration.coerceAtLeast(0L), exoPlayer.currentPosition + 10_000L)
                                     exoPlayer.seekTo(newPos)
                                     currentPosition = newPos
-                                    hudIcon = Icons.Default.FastForward
-                                    hudText = "+10s"
+                                    showHud(Icons.Default.FastForward, "+10s")
                                 }
                                 else -> {
-                                    // Center 50% width: Toggle Play / Pause immediately
                                     if (exoPlayer.isPlaying) {
                                         exoPlayer.pause()
                                         isPlaying = false
@@ -530,11 +620,8 @@ fun VideoPlayerScreen(
                         }
                     )
                 }
-                .pointerInput(Unit) {
-                    // Point 27 (Steps 2 & 3):
-                    // - Requires dead-zone threshold > viewConfiguration.touchSlop * 2 before starting seek or vertical adjust
-                    // - Smooth horizontal swipe seek (full screen width = 75 seconds max)
-                    // - Cumulative vertical delta tracking (totalDragY / screenHeight) with 0.6f damping factor
+                // Handler 3: Single-finger Seek / Brightness / Volume drag (only when unlocked & unzoomed)
+                .pointerInput(isScreenLocked) {
                     var gestureMode = DragGestureMode.NONE
                     var startX = 0f
                     var totalDragX = 0f
@@ -570,76 +657,83 @@ fun VideoPlayerScreen(
                             isScrubbing = false
                         },
                         onDrag = { change, dragAmount ->
-                            change.consume()
-                            totalDragX += dragAmount.x
-                            totalDragY += dragAmount.y
+                            if (!isScreenLocked && videoZoom <= 1.01f && !change.isConsumed) {
+                                change.consume()
+                                totalDragX += dragAmount.x
+                                totalDragY += dragAmount.y
 
-                            val deadZone = viewConfiguration.touchSlop * 2f
-                            val screenWidth = size.width.toFloat().coerceAtLeast(1f)
-                            val screenHeight = size.height.toFloat().coerceAtLeast(1f)
+                                val deadZone = viewConfiguration.touchSlop * 2f
+                                val screenWidth = size.width.toFloat().coerceAtLeast(1f)
+                                val screenHeight = size.height.toFloat().coerceAtLeast(1f)
 
-                            if (gestureMode == DragGestureMode.NONE) {
-                                if (abs(totalDragX) > deadZone && abs(totalDragX) > abs(totalDragY) * 1.2f) {
-                                    gestureMode = DragGestureMode.HORIZONTAL_SEEK
-                                    // Reset baseline so seek starts smoothly right after crossing dead-zone
-                                    totalDragX = 0f
-                                    gestureStartPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-                                } else if (abs(totalDragY) > deadZone && abs(totalDragY) > abs(totalDragX) * 1.2f) {
-                                    gestureMode = if (startX < screenWidth * 0.5f) {
-                                        DragGestureMode.VERTICAL_BRIGHTNESS
-                                    } else {
-                                        DragGestureMode.VERTICAL_VOLUME
+                                if (gestureMode == DragGestureMode.NONE) {
+                                    if (abs(totalDragX) > deadZone && abs(totalDragX) > abs(totalDragY) * 1.2f) {
+                                        gestureMode = DragGestureMode.HORIZONTAL_SEEK
+                                        totalDragX = 0f
+                                        gestureStartPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                                    } else if (abs(totalDragY) > deadZone && abs(totalDragY) > abs(totalDragX) * 1.2f) {
+                                        gestureMode = if (startX < screenWidth * 0.5f) {
+                                            DragGestureMode.VERTICAL_BRIGHTNESS
+                                        } else {
+                                            DragGestureMode.VERTICAL_VOLUME
+                                        }
+                                        totalDragY = 0f
                                     }
-                                    totalDragY = 0f
                                 }
-                            }
 
-                            when (gestureMode) {
-                                DragGestureMode.HORIZONTAL_SEEK -> {
-                                    // Full screen width drag = 75 seconds (75,000 ms) smooth seek
-                                    val seekRangeMs = 75_000f
-                                    val deltaMs = ((totalDragX / screenWidth) * seekRangeMs).toLong()
-                                    val maxDur = duration.coerceAtLeast(1L)
-                                    val target = (gestureStartPositionMs + deltaMs).coerceIn(0L, maxDur)
-                                    isScrubbing = true
-                                    scrubPosition = target
-                                    currentPosition = target
-                                    exoPlayer.seekTo(target)
-                                    hudIcon = if (deltaMs >= 0L) Icons.Default.FastForward else Icons.Default.FastRewind
-                                    val sign = if (deltaMs >= 0L) "+" else "-"
-                                    val deltaSec = abs(deltaMs / 1000L)
-                                    hudText = "${formatTime(target)} ($sign${deltaSec}s)"
-                                }
-                                DragGestureMode.VERTICAL_BRIGHTNESS -> {
-                                    activity?.let { act ->
+                                when (gestureMode) {
+                                    DragGestureMode.HORIZONTAL_SEEK -> {
+                                        val seekRangeMs = 75_000f
+                                        val deltaMs = ((totalDragX / screenWidth) * seekRangeMs).toLong()
+                                        val maxDur = duration.coerceAtLeast(1L)
+                                        val target = (gestureStartPositionMs + deltaMs).coerceIn(0L, maxDur)
+                                        isScrubbing = true
+                                        scrubPosition = target
+                                        currentPosition = target
+                                        exoPlayer.seekTo(target)
+                                        val sign = if (deltaMs >= 0L) "+" else "-"
+                                        val deltaSec = abs(deltaMs / 1000L)
+                                        showHud(
+                                            if (deltaMs >= 0L) Icons.Default.FastForward else Icons.Default.FastRewind,
+                                            "${formatTime(target)} ($sign${deltaSec}s)"
+                                        )
+                                    }
+                                    DragGestureMode.VERTICAL_BRIGHTNESS -> {
+                                        activity?.let { act ->
+                                            val damping = 0.6f
+                                            val deltaFraction = (-totalDragY / screenHeight) * damping
+                                            val newBrightness = (gestureStartBrightness + deltaFraction).coerceIn(0.02f, 1.0f)
+                                            val lp = act.window.attributes
+                                            lp.screenBrightness = newBrightness
+                                            act.window.attributes = lp
+                                            showHud(
+                                                Icons.Default.BrightnessMedium,
+                                                "Brightness ${(newBrightness * 100f).roundToInt()}%"
+                                            )
+                                        }
+                                    }
+                                    DragGestureMode.VERTICAL_VOLUME -> {
+                                        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
                                         val damping = 0.6f
                                         val deltaFraction = (-totalDragY / screenHeight) * damping
-                                        val newBrightness = (gestureStartBrightness + deltaFraction).coerceIn(0.02f, 1.0f)
-                                        val lp = act.window.attributes
-                                        lp.screenBrightness = newBrightness
-                                        act.window.attributes = lp
-                                        hudIcon = Icons.Default.BrightnessMedium
-                                        hudText = "Brightness ${(newBrightness * 100f).roundToInt()}%"
+                                        val newVolFloat = (gestureStartVolumeFloat + deltaFraction * maxVol).coerceIn(0f, maxVol.toFloat())
+                                        val targetVolInt = newVolFloat.roundToInt().coerceIn(0, maxVol)
+                                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVolInt, 0)
+                                        if (targetVolInt > 0 && isMuted) {
+                                            isMuted = false
+                                            exoPlayer.volume = 1f
+                                        }
+                                        val pct = ((targetVolInt.toFloat() / maxVol.toFloat()) * 100f).roundToInt()
+                                        showHud(Icons.Default.VolumeUp, "Volume $pct%")
                                     }
+                                    DragGestureMode.NONE -> Unit
                                 }
-                                DragGestureMode.VERTICAL_VOLUME -> {
-                                    val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                                    val damping = 0.6f
-                                    val deltaFraction = (-totalDragY / screenHeight) * damping
-                                    val newVolFloat = (gestureStartVolumeFloat + deltaFraction * maxVol).coerceIn(0f, maxVol.toFloat())
-                                    val targetVolInt = newVolFloat.roundToInt().coerceIn(0, maxVol)
-                                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVolInt, 0)
-                                    val pct = ((targetVolInt.toFloat() / maxVol.toFloat()) * 100f).roundToInt()
-                                    hudIcon = Icons.Default.VolumeUp
-                                    hudText = "Volume $pct%"
-                                }
-                                DragGestureMode.NONE -> Unit
                             }
                         }
                     )
                 }
         ) {
-            // Point 21 (Layer 3): ExoPlayer Surface View with keepScreenOn = true
+            // Video Playback Surface with Interactive Pinch-to-Zoom & Pan graphicsLayer
             AndroidView(
                 factory = { ctx ->
                     PlayerView(ctx).apply {
@@ -652,12 +746,19 @@ fun VideoPlayerScreen(
                 },
                 update = { view ->
                     view.keepScreenOn = true
+                    view.resizeMode = resizeModes[resizeIndex].first
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = videoZoom,
+                        scaleY = videoZoom,
+                        translationX = videoPanX,
+                        translationY = videoPanY
+                    )
             )
 
-            // Point 24: Center of the screen has NO permanent buttons!
-            // Only shows a brief 400ms subtle fade-out Play/Pause icon when double-tapped in the center.
+            // Center 400ms Play/Pause indicator on double-tap
             AnimatedVisibility(
                 visible = centerDoubleTapIcon != null,
                 enter = fadeIn(),
@@ -674,37 +775,42 @@ fun VideoPlayerScreen(
                 }
             }
 
-            // Subtle Transparent HUD Gesture Text Overlay (top-center)
+            // Crisp Translucent Pill HUD Overlay (top-center: Zoom %, Speed, Brightness, Volume, Seek, Loop)
             AnimatedVisibility(
                 visible = hudText != null,
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 84.dp)
+                    .padding(top = 82.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = Color.Black.copy(alpha = 0.65f)
                 ) {
-                    hudIcon?.let { icon ->
-                        Icon(
-                            icon,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) {
+                        hudIcon?.let { icon ->
+                            Icon(
+                                icon,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text(
+                            text = hudText ?: "",
+                            color = Color.White,
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                shadow = overlayTextShadow
+                            )
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
                     }
-                    Text(
-                        text = hudText ?: "",
-                        color = Color.White,
-                        style = TextStyle(
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                            shadow = overlayTextShadow
-                        )
-                    )
                 }
             }
 
@@ -747,10 +853,57 @@ fun VideoPlayerScreen(
                 }
             }
 
-            // Point 23 & Point 25: Auto-Hiding 100% Transparent Top Bar
-            // Contains Back arrow, Title, Unhide, Delete, and top-right Small Rotate icon & Fit icon.
+            // Screen Touch Lock Floating "Tap to Unlock" Pill
             AnimatedVisibility(
-                visible = areControlsVisible,
+                visible = isScreenLocked && showUnlockHint,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 28.dp)
+            ) {
+                Surface(
+                    onClick = {
+                        isScreenLocked = false
+                        showUnlockHint = false
+                        areControlsVisible = true
+                        registerInteraction()
+                        showHud(Icons.Default.LockOpen, "Screen Unlocked")
+                    },
+                    shape = RoundedCornerShape(50),
+                    color = Color.Black.copy(alpha = 0.72f),
+                    modifier = Modifier
+                        .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(50))
+                        .testTag("player_unlock_touch_button")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Unlock Screen",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Tap to Unlock",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            // FIX 1: TOP OVERLAY BAR
+            // Left: Back Button + Video Title & Resolution Subtitle
+            // Right: Interactive Zoom % Pill + Playback Speed Pill + Aspect Ratio Pill + Rotate Button
+            // (NO Unhide or Delete buttons)
+            AnimatedVisibility(
+                visible = areControlsVisible && !isScreenLocked && !showMoreVideosSheet,
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier.align(Alignment.TopCenter)
@@ -758,9 +911,13 @@ fun VideoPlayerScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.Transparent)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Black.copy(alpha = 0.65f), Color.Transparent)
+                            )
+                        )
                         .statusBarsPadding()
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -778,13 +935,13 @@ fun VideoPlayerScreen(
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .padding(horizontal = 8.dp)
+                            .padding(end = 8.dp)
                     ) {
                         Text(
                             text = activeVideoItem.fileName,
                             color = Color.White,
                             style = TextStyle(
-                                fontSize = 15.sp,
+                                fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold,
                                 shadow = overlayTextShadow
                             ),
@@ -794,91 +951,180 @@ fun VideoPlayerScreen(
                         videoResolutionLabel?.let { res ->
                             Text(
                                 text = res,
-                                color = Color.White.copy(alpha = 0.8f),
+                                color = Color.White.copy(alpha = 0.78f),
                                 style = TextStyle(
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
                                     shadow = overlayTextShadow
-                                )
+                                ),
+                                maxLines = 1
                             )
                         }
                     }
 
-                    // Unhide Video Button (Point 10: LockOpen icon + Confirmation + Contextual PIN)
-                    IconButton(
-                        onClick = {
-                            registerInteraction()
-                            exoPlayer.pause()
-                            isPlaying = false
-                            showUnhideConfirmDialog = true
-                        },
-                        modifier = Modifier.testTag("player_unhide")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(
-                            Icons.Default.LockOpen,
-                            contentDescription = "Unhide Video",
-                            tint = Color.White
-                        )
-                    }
+                        // a) Interactive Zoom Badge / Button (100% .. 400%)
+                        val isZoomed = videoZoom > 1.01f
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(
+                                    if (isZoomed) MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                                    else Color.Black.copy(alpha = 0.55f)
+                                )
+                                .combinedClickable(
+                                    onClick = cycleZoomStep,
+                                    onLongClick = {
+                                        registerInteraction()
+                                        videoZoom = 1.0f
+                                        videoPanX = 0f
+                                        videoPanY = 0f
+                                        showHud(Icons.Default.ZoomIn, "Zoom 100%")
+                                    }
+                                )
+                                .padding(horizontal = 9.dp, vertical = 6.dp)
+                                .testTag("player_zoom_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ZoomIn,
+                                contentDescription = "Zoom",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "${(videoZoom * 100f).roundToInt()}%",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
 
-                    // Delete Video Button (Point 9: Confirmation + Contextual PIN)
-                    IconButton(
-                        onClick = {
-                            registerInteraction()
-                            exoPlayer.pause()
-                            isPlaying = false
-                            showDeleteConfirmDialog = true
-                        },
-                        modifier = Modifier.testTag("player_delete")
-                    ) {
-                        Icon(
-                            Icons.Default.Delete,
-                            contentDescription = "Delete Video",
-                            tint = Color.White
-                        )
-                    }
+                        // b) Playback Speed Button (0.25x .. 2.0x)
+                        Box {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(
+                                        if (abs(playbackSpeed - 1.0f) > 0.01f) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                                        } else {
+                                            Color.Black.copy(alpha = 0.55f)
+                                        }
+                                    )
+                                    .clickable {
+                                        registerInteraction()
+                                        showSpeedMenu = true
+                                    }
+                                    .padding(horizontal = 9.dp, vertical = 6.dp)
+                                    .testTag("player_speed_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Speed,
+                                    contentDescription = "Playback Speed",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "${formatSpeed(playbackSpeed)}x",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
 
-                    // Point 25 (Step 2): Small Corner Rotate Screen Icon in Top-Right
-                    IconButton(
-                        onClick = toggleOrientation,
-                        modifier = Modifier.testTag("toggle_orientation_button")
-                    ) {
-                        Icon(
-                            Icons.Default.ScreenRotation,
-                            contentDescription = "Rotate Screen",
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
+                            DropdownMenu(
+                                expanded = showSpeedMenu,
+                                onDismissRequest = {
+                                    showSpeedMenu = false
+                                    registerInteraction()
+                                }
+                            ) {
+                                listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { speed ->
+                                    val formatted = "${formatSpeed(speed)}x"
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = formatted,
+                                                fontWeight = if (abs(playbackSpeed - speed) < 0.01f) FontWeight.Bold else FontWeight.Normal
+                                            )
+                                        },
+                                        onClick = {
+                                            registerInteraction()
+                                            playbackSpeed = speed
+                                            exoPlayer.setPlaybackSpeed(speed)
+                                            showSpeedMenu = false
+                                            showHud(Icons.Default.Speed, "Speed $formatted")
+                                        }
+                                    )
+                                }
+                            }
+                        }
 
-                    // Point 25 (Step 2): Fit / Aspect Ratio Icon in Top-Right
-                    IconButton(
-                        onClick = {
-                            registerInteraction()
-                            resizeIndex = (resizeIndex + 1) % resizeModes.size
-                            val nextMode = resizeModes[resizeIndex]
-                            playerViewRef?.resizeMode = nextMode.first
-                            hudIcon = Icons.Default.AspectRatio
-                            hudText = nextMode.second
-                        },
-                        modifier = Modifier.testTag("player_aspect_ratio")
-                    ) {
-                        Icon(
-                            Icons.Default.AspectRatio,
-                            contentDescription = "Fit / Aspect Ratio",
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        // c) Video Size / Aspect Ratio Button (Fit / Crop / Stretch)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .clickable {
+                                    registerInteraction()
+                                    resizeIndex = (resizeIndex + 1) % resizeModes.size
+                                    val nextMode = resizeModes[resizeIndex]
+                                    playerViewRef?.resizeMode = nextMode.first
+                                    showHud(Icons.Default.AspectRatio, nextMode.third)
+                                }
+                                .padding(horizontal = 9.dp, vertical = 6.dp)
+                                .testTag("player_aspect_ratio")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AspectRatio,
+                                contentDescription = "Video Size",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = resizeModes[resizeIndex].second,
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        // d) Rotate Screen Button
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .clickable { toggleOrientation() }
+                                .testTag("toggle_orientation_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ScreenRotation,
+                                contentDescription = "Rotate Screen",
+                                tint = Color.White,
+                                modifier = Modifier.size(17.dp)
+                            )
+                        }
                     }
                 }
             }
 
-            // Hotfix #5: Bottom Auto-Hiding Control Layout:
-            // - Row 1 (Upper Row): Compact time text + speed pill, followed by full-width YouTube-style thin Slider
-            // - Row 2 (Lower Row — Directly BELOW Slider): Previous Video, Play/Pause, Next Video on left,
-            //   and "More Videos" button in the right corner.
+            // FIX 2: 3-LAYER BOTTOM OVERLAY
+            // Layer 1 (Above Slider): Left Timestamp Pill | Right Quick Fullscreen/Fit Button
+            // Layer 2: Full-Width Ultra-Thin (2.5.dp) Seek Slider
+            // Layer 3 (Below Slider): Left Action Pill Container | Right "More videos" Pill with Mini 16:9 Preview
             AnimatedVisibility(
-                visible = areControlsVisible,
+                visible = areControlsVisible && !isScreenLocked && !showMoreVideosSheet,
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier.align(Alignment.BottomCenter)
@@ -891,90 +1137,87 @@ fun VideoPlayerScreen(
                 val hasPrevVideo = currentVideoIndex > 0
                 val hasNextVideo = currentVideoIndex >= 0 && currentVideoIndex < playlistVideos.lastIndex
 
+                // Next video preview for the bottom-right "More videos" pill
+                val nextPreviewVideo = remember(activeVideoItem.id, playlistVideos, currentVideoIndex) {
+                    when {
+                        hasNextVideo -> playlistVideos[currentVideoIndex + 1]
+                        playlistVideos.size > 1 -> playlistVideos.first()
+                        else -> activeVideoItem
+                    }
+                }
+                val previewBlob = remember(nextPreviewVideo.id, nextPreviewVideo.encryptedRelativePath, vaultBlobsDir) {
+                    File(vaultBlobsDir, nextPreviewVideo.encryptedRelativePath)
+                }
+                var miniPreviewThumb by remember(nextPreviewVideo.id) {
+                    mutableStateOf<ImageBitmap?>(ThumbnailCacheManager.getCached(nextPreviewVideo.id))
+                }
+                LaunchedEffect(nextPreviewVideo.id, previewBlob) {
+                    if (miniPreviewThumb == null) {
+                        miniPreviewThumb = ThumbnailCacheManager.loadThumbnail(nextPreviewVideo, previewBlob, masterKey)
+                    }
+                }
+
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.Transparent)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.72f))
+                            )
+                        )
                         .navigationBarsPadding()
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
                 ) {
-                    // ROW 1 (UPPER ROW): Timestamp & Speed badge + Ultra-Thin Full-Width Progress Slider on top
+                    // LAYER 1 (Directly Above the Slider): Timestamp Pill on Left + Quick Fullscreen/Fit Toggle on Right
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 6.dp),
+                            .padding(horizontal = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "${formatTime(activePos)} / ${formatTime(duration)}",
-                            color = Color.White,
-                            style = TextStyle(
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .padding(horizontal = 12.dp, vertical = 5.dp)
+                        ) {
+                            Text(
+                                text = "${formatTime(activePos)} / ${formatTime(duration)}",
+                                color = Color.White,
                                 fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                shadow = overlayTextShadow
+                                fontWeight = FontWeight.SemiBold
                             )
-                        )
+                        }
 
-                        // Playback Speed selector
-                        Box {
-                            Row(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        registerInteraction()
-                                        showSpeedMenu = true
-                                    }
-                                    .padding(horizontal = 8.dp, vertical = 2.dp)
-                                    .testTag("player_speed_btn"),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    Icons.Default.Speed,
-                                    contentDescription = "Speed",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "${playbackSpeed}x",
-                                    color = Color.White,
-                                    style = TextStyle(
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        shadow = overlayTextShadow
-                                    )
-                                )
-                            }
-
-                            DropdownMenu(
-                                expanded = showSpeedMenu,
-                                onDismissRequest = {
-                                    showSpeedMenu = false
+                        val isExpandedMode = resizeIndex != 0
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .clickable {
                                     registerInteraction()
+                                    resizeIndex = if (resizeIndex == 0) 1 else 0
+                                    val nextMode = resizeModes[resizeIndex]
+                                    playerViewRef?.resizeMode = nextMode.first
+                                    showHud(Icons.Default.AspectRatio, nextMode.third)
                                 }
-                            ) {
-                                listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { speed ->
-                                    DropdownMenuItem(
-                                        text = {
-                                            Text(
-                                                "${speed}x",
-                                                fontWeight = if (playbackSpeed == speed) FontWeight.Bold else FontWeight.Normal
-                                            )
-                                        },
-                                        onClick = {
-                                            registerInteraction()
-                                            playbackSpeed = speed
-                                            exoPlayer.setPlaybackSpeed(speed)
-                                            showSpeedMenu = false
-                                        }
-                                    )
-                                }
-                            }
+                                .testTag("player_quick_fullscreen_toggle")
+                        ) {
+                            Icon(
+                                imageVector = if (isExpandedMode) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
+                                contentDescription = if (isExpandedMode) "Fit to Screen" else "Fill Screen",
+                                tint = Color.White,
+                                modifier = Modifier.size(20.dp)
+                            )
                         }
                     }
 
-                    // Full-Width Ultra-Thin (2.5.dp) YouTube-Style Progress Slider
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // LAYER 2: Full-Width Ultra-Thin (2.5.dp) YouTube-Style Progress Slider
                     Slider(
                         value = activePos.toFloat().coerceIn(0f, maxOf(1f, duration.toFloat())),
                         onValueChange = { pos ->
@@ -1015,19 +1258,25 @@ fun VideoPlayerScreen(
                             .testTag("player_thin_slider")
                     )
 
-                    // ROW 2 (LOWER ROW — DIRECTLY BELOW SLIDER):
-                    // Left: Previous Video, Play/Pause, Next Video
-                    // Right: "More Videos" Thumbnail Drawer Button
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    // LAYER 3 (Directly Below the Slider):
+                    // Bottom-Left Action Pill Container & Bottom-Right "More videos" Pill with Mini Preview
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 2.dp, vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // Bottom-Left Pill Container: Prev, -10s, Play/Pause, +10s, Next, Loop, Mute, Lock
                         Row(
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .clip(RoundedCornerShape(24.dp))
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             IconButton(
                                 onClick = {
@@ -1040,14 +1289,34 @@ fun VideoPlayerScreen(
                                     }
                                 },
                                 modifier = Modifier
-                                    .size(40.dp)
+                                    .size(38.dp)
                                     .testTag("player_previous_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.SkipPrevious,
                                     contentDescription = "Previous Video",
                                     tint = if (hasPrevVideo) Color.White else Color.White.copy(alpha = 0.55f),
-                                    modifier = Modifier.size(26.dp)
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    val newPos = maxOf(0L, exoPlayer.currentPosition - 10_000L)
+                                    exoPlayer.seekTo(newPos)
+                                    currentPosition = newPos
+                                    showHud(Icons.Default.FastRewind, "-10s")
+                                },
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .testTag("player_rewind_10s_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Replay10,
+                                    contentDescription = "Rewind 10s",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(22.dp)
                                 )
                             }
 
@@ -1066,14 +1335,34 @@ fun VideoPlayerScreen(
                                     }
                                 },
                                 modifier = Modifier
-                                    .size(44.dp)
+                                    .size(42.dp)
                                     .testTag("player_play_pause")
                             ) {
                                 Icon(
                                     imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                                     contentDescription = if (isPlaying) "Pause" else "Play",
                                     tint = Color.White,
-                                    modifier = Modifier.size(30.dp)
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    val newPos = minOf(duration.coerceAtLeast(0L), exoPlayer.currentPosition + 10_000L)
+                                    exoPlayer.seekTo(newPos)
+                                    currentPosition = newPos
+                                    showHud(Icons.Default.FastForward, "+10s")
+                                },
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .testTag("player_forward_10s_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Forward10,
+                                    contentDescription = "Forward 10s",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(22.dp)
                                 )
                             }
 
@@ -1086,220 +1375,336 @@ fun VideoPlayerScreen(
                                 },
                                 enabled = hasNextVideo,
                                 modifier = Modifier
-                                    .size(40.dp)
+                                    .size(38.dp)
                                     .testTag("player_next_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.SkipNext,
                                     contentDescription = "Next Video",
                                     tint = if (hasNextVideo) Color.White else Color.White.copy(alpha = 0.35f),
-                                    modifier = Modifier.size(26.dp)
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    val nextRepeat = !isRepeatOne
+                                    isRepeatOne = nextRepeat
+                                    exoPlayer.repeatMode = if (nextRepeat) {
+                                        Player.REPEAT_MODE_ONE
+                                    } else {
+                                        Player.REPEAT_MODE_OFF
+                                    }
+                                    showHud(
+                                        if (nextRepeat) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                                        if (nextRepeat) "Loop On" else "Loop Off"
+                                    )
+                                },
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .testTag("player_loop_button")
+                            ) {
+                                Icon(
+                                    imageVector = if (isRepeatOne) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                                    contentDescription = if (isRepeatOne) "Loop On" else "Loop Off",
+                                    tint = if (isRepeatOne) MaterialTheme.colorScheme.primary else Color.White,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    registerInteraction()
+                                    val nextMuted = !isMuted
+                                    isMuted = nextMuted
+                                    exoPlayer.volume = if (nextMuted) 0f else 1f
+                                    showHud(
+                                        if (nextMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                        if (nextMuted) "Muted" else "Unmuted"
+                                    )
+                                },
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .testTag("player_mute_button")
+                            ) {
+                                Icon(
+                                    imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                    contentDescription = if (isMuted) "Unmute" else "Mute",
+                                    tint = if (isMuted) MaterialTheme.colorScheme.error else Color.White,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    isScreenLocked = true
+                                    areControlsVisible = false
+                                    showUnlockHint = true
+                                    showHud(Icons.Default.Lock, "Screen Locked")
+                                },
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .testTag("player_lock_touch_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LockOpen,
+                                    contentDescription = "Lock Screen Touches",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(19.dp)
                                 )
                             }
                         }
 
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        // Bottom-Right "More videos" Pill with Mini 16:9 Thumbnail Preview
                         Row(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(24.dp))
+                                .background(Color.Black.copy(alpha = 0.65f))
                                 .clickable {
                                     registerInteraction()
                                     showMoreVideosSheet = true
                                 }
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp)
                                 .testTag("player_more_videos_button"),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                Icons.Default.VideoLibrary,
-                                contentDescription = "More Videos",
-                                tint = Color.White,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "More Videos",
+                                text = "More videos",
                                 color = Color.White,
-                                style = TextStyle(
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    shadow = overlayTextShadow
-                                )
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1
                             )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .width(38.dp)
+                                    .height(22.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(0xFF1A1D24)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (miniPreviewThumb != null) {
+                                    Image(
+                                        bitmap = miniPreviewThumb!!,
+                                        contentDescription = nextPreviewVideo.fileName,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Movie,
+                                        contentDescription = null,
+                                        tint = Color.White.copy(alpha = 0.6f),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-    }
 
-    // Point 26 (Step 2): "More Videos" YouTube-Style Translucent Thumbnail Sheet
-    if (showMoreVideosSheet) {
-        ModalBottomSheet(
-            onDismissRequest = {
-                showMoreVideosSheet = false
-                registerInteraction()
-            },
-            containerColor = Color(0xE6101218),
-            contentColor = Color.White
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            // FIX 3: REDESIGNED "MORE VIDEOS" FULL/BOTTOM OVERLAY WITH LARGE 16:9 THUMBNAIL CARDS
+            AnimatedVisibility(
+                visible = showMoreVideosSheet,
+                enter = fadeIn() + slideInVertically(initialOffsetY = { it / 3 }),
+                exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 3 }),
+                modifier = Modifier.fillMaxSize()
             ) {
-                Row(
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.VideoLibrary,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "More Videos (${playlistVideos.size})",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    }
-                    TextButton(
-                        onClick = {
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.88f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
                             showMoreVideosSheet = false
                             registerInteraction()
                         }
-                    ) {
-                        Text("Close", color = Color.White.copy(alpha = 0.8f))
-                    }
-                }
-
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 340.dp),
-                    contentPadding = PaddingValues(bottom = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(playlistVideos, key = { it.id }) { videoItem ->
-                        val isCurrentlyPlaying = videoItem.id == activeVideoItem.id
-                        val itemBlob = remember(videoItem.encryptedRelativePath) {
-                            File(vaultBlobsDir, videoItem.encryptedRelativePath)
-                        }
-                        var thumb by remember(videoItem.id) {
-                            mutableStateOf<ImageBitmap?>(ThumbnailCacheManager.getCached(videoItem.id))
-                        }
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null
+                            ) { /* consume click inside drawer */ }
+                            .navigationBarsPadding()
+                            .padding(top = 16.dp, bottom = 18.dp)
+                    ) {
+                        // Header Row: "More videos" + Count Badge on Left, Close (X) on Right
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "More videos",
+                                    color = Color.White,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(Color.White.copy(alpha = 0.16f))
+                                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = "${playlistVideos.size}",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
 
-                        LaunchedEffect(videoItem.id, itemBlob) {
-                            if (thumb == null) {
-                                thumb = ThumbnailCacheManager.loadThumbnail(videoItem, itemBlob, masterKey)
+                            IconButton(
+                                onClick = {
+                                    showMoreVideosSheet = false
+                                    registerInteraction()
+                                },
+                                modifier = Modifier.testTag("more_videos_close_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Close More Videos",
+                                    tint = Color.White
+                                )
                             }
                         }
 
-                        Card(
-                            onClick = {
-                                showMoreVideosSheet = false
-                                registerInteraction()
-                                if (videoItem.id != activeVideoItem.id) {
-                                    activeVideoItem = videoItem
-                                }
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .then(
-                                    if (isCurrentlyPlaying) {
-                                        Modifier.border(
-                                            1.5.dp,
-                                            MaterialTheme.colorScheme.primary,
-                                            RoundedCornerShape(12.dp)
-                                        )
-                                    } else {
-                                        Modifier
-                                    }
-                                ),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isCurrentlyPlaying) {
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
-                                } else {
-                                    Color.White.copy(alpha = 0.08f)
-                                }
-                            )
+                        // Large Horizontal 16:9 Video Cards (Title & Size Directly BELOW Thumbnail)
+                        LazyRow(
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // 16:9 Video Thumbnail Preview
-                                Box(
-                                    modifier = Modifier
-                                        .width(112.dp)
-                                        .height(64.dp)
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .background(Color.Black),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    if (thumb != null) {
-                                        Image(
-                                            bitmap = thumb!!,
-                                            contentDescription = videoItem.fileName,
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
-                                    } else {
-                                        Icon(
-                                            Icons.Default.Movie,
-                                            contentDescription = null,
-                                            tint = Color.White.copy(alpha = 0.5f),
-                                            modifier = Modifier.size(28.dp)
-                                        )
-                                    }
+                            items(playlistVideos, key = { it.id }) { videoItem ->
+                                val isCurrentlyPlaying = videoItem.id == activeVideoItem.id
+                                val itemBlob = remember(videoItem.encryptedRelativePath) {
+                                    File(vaultBlobsDir, videoItem.encryptedRelativePath)
+                                }
+                                var thumb by remember(videoItem.id) {
+                                    mutableStateOf<ImageBitmap?>(ThumbnailCacheManager.getCached(videoItem.id))
+                                }
 
-                                    // Duration badge at bottom-right of thumbnail
+                                LaunchedEffect(videoItem.id, itemBlob) {
+                                    if (thumb == null) {
+                                        thumb = ThumbnailCacheManager.loadThumbnail(videoItem, itemBlob, masterKey)
+                                    }
+                                }
+
+                                Column(
+                                    modifier = Modifier
+                                        .width(240.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable {
+                                            showMoreVideosSheet = false
+                                            registerInteraction()
+                                            if (videoItem.id != activeVideoItem.id) {
+                                                activeVideoItem = videoItem
+                                            }
+                                        }
+                                ) {
+                                    // Top of Card: Large 240.dp x 135.dp (16:9) Rounded Thumbnail
                                     Box(
                                         modifier = Modifier
-                                            .align(Alignment.BottomEnd)
-                                            .padding(4.dp)
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(Color.Black.copy(alpha = 0.78f))
-                                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                                            .width(240.dp)
+                                            .height(135.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0xFF14171F))
+                                            .then(
+                                                if (isCurrentlyPlaying) {
+                                                    Modifier.border(
+                                                        width = 2.dp,
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        shape = RoundedCornerShape(12.dp)
+                                                    )
+                                                } else {
+                                                    Modifier
+                                                }
+                                            ),
+                                        contentAlignment = Alignment.Center
                                     ) {
-                                        Text(
-                                            text = if (videoItem.durationMs > 0L) formatTime(videoItem.durationMs) else "VIDEO",
-                                            color = Color.White,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        if (thumb != null) {
+                                            Image(
+                                                bitmap = thumb!!,
+                                                contentDescription = videoItem.fileName,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = Icons.Default.Movie,
+                                                contentDescription = null,
+                                                tint = Color.White.copy(alpha = 0.5f),
+                                                modifier = Modifier.size(36.dp)
+                                            )
+                                        }
+
+                                        if (isCurrentlyPlaying) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.TopStart)
+                                                    .padding(8.dp)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(MaterialTheme.colorScheme.primary)
+                                                    .padding(horizontal = 7.dp, vertical = 3.dp)
+                                            ) {
+                                                Text(
+                                                    text = "NOW PLAYING",
+                                                    color = Color.White,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+
+                                        // Bottom-Right Duration Badge
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomEnd)
+                                                .padding(8.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(Color.Black.copy(alpha = 0.80f))
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = if (videoItem.durationMs > 0L) formatTime(videoItem.durationMs) else "VIDEO",
+                                                color = Color.White,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
                                     }
-                                }
 
-                                Spacer(modifier = Modifier.width(12.dp))
-
-                                Column(modifier = Modifier.weight(1f)) {
+                                    // Bottom of Card: Title & File Size Directly BELOW Thumbnail
+                                    Spacer(modifier = Modifier.height(8.dp))
                                     Text(
                                         text = videoItem.fileName,
                                         color = Color.White,
-                                        fontWeight = FontWeight.SemiBold,
                                         fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Spacer(modifier = Modifier.height(2.dp))
                                     Text(
-                                        text = if (isCurrentlyPlaying) "Now Playing"
-                                        else formatVideoSize(videoItem.fileSize),
-                                        color = if (isCurrentlyPlaying) MaterialTheme.colorScheme.primary
-                                        else Color.White.copy(alpha = 0.65f),
-                                        fontSize = 11.sp,
-                                        fontWeight = if (isCurrentlyPlaying) FontWeight.Bold else FontWeight.Normal
+                                        text = formatVideoSize(videoItem.fileSize),
+                                        color = Color.White.copy(alpha = 0.65f),
+                                        fontSize = 12.sp,
+                                        maxLines = 1
                                     )
                                 }
                             }
@@ -1309,118 +1714,8 @@ fun VideoPlayerScreen(
             }
         }
     }
-
-    // Point 10: Step 1 Confirmation Dialog before Unhide -> Step 2 Contextual PIN Gate
-    if (showUnhideConfirmDialog) {
-        val targetItem = activeVideoItem
-        AlertDialog(
-            onDismissRequest = { showUnhideConfirmDialog = false },
-            shape = RoundedCornerShape(16.dp),
-            title = { Text("Unhide Media?", fontWeight = FontWeight.Bold) },
-            text = {
-                Text("Unhide and restore '${targetItem.fileName}' to your phone?")
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showUnhideConfirmDialog = false
-                        pendingPinActionTitle = "Confirm Unhide Media"
-                        pendingPinActionCallback = {
-                            try {
-                                exoPlayer.stop()
-                            } catch (_: Throwable) {
-                            }
-                            onUnhide(targetItem)
-                        }
-                    }
-                ) {
-                    Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Verify PIN & Unhide")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUnhideConfirmDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // Point 9: Step 1 Confirmation Dialog before Delete -> Step 2 Contextual PIN Gate
-    if (showDeleteConfirmDialog) {
-        val targetItem = activeVideoItem
-        AlertDialog(
-            onDismissRequest = { showDeleteConfirmDialog = false },
-            shape = RoundedCornerShape(16.dp),
-            title = { Text("Delete selected item(s) permanently?", fontWeight = FontWeight.Bold) },
-            text = {
-                Text("Are you sure you want to delete '${targetItem.fileName}' permanently from your Vault? This action cannot be undone.")
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showDeleteConfirmDialog = false
-                        pendingPinActionTitle = "Delete Permanently"
-                        pendingPinActionCallback = {
-                            try {
-                                exoPlayer.stop()
-                            } catch (_: Throwable) {
-                            }
-                            onDelete(targetItem)
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                ) {
-                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Delete Permanently")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteConfirmDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // Point 7 & Point 8: Context-Aware CustomPinKeypadDialog
-    if (pendingPinActionTitle != null && pendingPinActionCallback != null) {
-        val itemFolder = remember(activeVideoItem.folderId, folders) {
-            activeVideoItem.folderId?.let { id -> folders.find { it.id == id } }
-        }
-        val usesCustomFolderPin = itemFolder != null && itemFolder.hasCustomPin()
-
-        CustomPinKeypadDialog(
-            title = if (usesCustomFolderPin) "Unlock '${itemFolder!!.folderName}'" else pendingPinActionTitle!!,
-            subtitle = if (usesCustomFolderPin) {
-                "Enter '${itemFolder!!.folderName}' Folder PIN and tap Unlock (✓)"
-            } else {
-                "Enter your Vault PIN and tap Unlock (✓)"
-            },
-            doneButtonLabel = "Unlock",
-            onVerifyPin = { inputPin ->
-                onVerifyContextualPin(activeVideoItem.folderId, inputPin)
-            },
-            onSuccess = {
-                val callback = pendingPinActionCallback
-                pendingPinActionTitle = null
-                pendingPinActionCallback = null
-                callback?.invoke()
-            },
-            onDismiss = {
-                pendingPinActionTitle = null
-                pendingPinActionCallback = null
-            }
-        )
-    }
 }
 
-/**
- * Point 22: Sanitizes any video filename so extra characters after `.mp4` (e.g. `video.mp4 (1)`)
- * or unusual extensions (`.mkv`, `.mov`, `.webm`, `.avi`, `.3gp`) resolve to a clean container extension.
- */
 private fun extractSanitizedVideoExtension(fileName: String, mimeType: String): String {
     val lower = fileName.lowercase(Locale.US)
     val regex = Regex("""\.(mp4|m4v|mkv|mov|webm|avi|3gp|3gpp|ts|m2ts|mts|flv|wmv)(?:[^a-z0-9]|$)""")
@@ -1440,6 +1735,15 @@ private fun extractSanitizedVideoExtension(fileName: String, mimeType: String): 
     }
 }
 
+private fun formatSpeed(speed: Float): String {
+    val scaled = (speed * 100f).roundToInt()
+    return when {
+        scaled % 100 == 0 -> "${scaled / 100}.0"
+        scaled % 10 == 0 -> "${scaled / 100}.${(scaled % 100) / 10}"
+        else -> String.format(Locale.US, "%.2f", speed)
+    }
+}
+
 private fun formatTime(ms: Long): String {
     val totalSeconds = (ms / 1000).coerceAtLeast(0)
     val hours = totalSeconds / 3600
@@ -1448,7 +1752,7 @@ private fun formatTime(ms: Long): String {
     return if (hours > 0) {
         String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
     } else {
-        String.format(Locale.US, "%02d:%02d", minutes, seconds)
+        String.format(Locale.US, "%d:%02d", minutes, seconds)
     }
 }
 
