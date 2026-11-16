@@ -61,6 +61,9 @@ interface VaultDao {
     @Query("UPDATE vault_items SET folderId = :targetFolderId WHERE id IN (:ids)")
     suspend fun moveItemsToFolder(ids: List<Long>, targetFolderId: Long?)
 
+    @Query("UPDATE vault_items SET lastPlaybackPositionMs = :positionMs WHERE id = :id")
+    suspend fun updatePlaybackPosition(id: Long, positionMs: Long)
+
     @Query("SELECT SUM(fileSize) FROM vault_items WHERE isDecoy = :isDecoy")
     suspend fun getTotalVaultSize(isDecoy: Boolean): Long?
 }

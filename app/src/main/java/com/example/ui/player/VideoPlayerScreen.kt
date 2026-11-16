@@ -41,6 +41,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -88,6 +89,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -162,6 +164,7 @@ fun VideoPlayerScreen(
     masterKey: SecretKey,
     vaultBlobsDir: File = blobFile.parentFile ?: blobFile,
     playlistVideos: List<VaultItem> = listOf(vaultItem),
+    onSavePlaybackPosition: (VaultItem, Long) -> Unit = { _, _ -> },
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -199,12 +202,20 @@ fun VideoPlayerScreen(
     }
 
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+    // FIX 7: Hold-to-2x temporary speed boost state
+    var isLongPress2xActive by remember { mutableStateOf(false) }
+    var speedBeforeLongPress by remember { mutableFloatStateOf(1.0f) }
+
     var showSpeedMenu by remember { mutableStateOf(false) }
     var showMoreVideosSheet by remember { mutableStateOf(false) }
+    val moreVideosListState = rememberLazyListState()
     var isLandscapeMode by remember { mutableStateOf(false) }
     var videoResolutionLabel by remember { mutableStateOf<String?>(null) }
     var isRepeatOne by remember { mutableStateOf(false) }
     var isMuted by remember { mutableStateOf(false) }
+
+    // FIX 6: Session map of saved playback positions across playlist switches
+    val sessionPositions = remember { mutableStateMapOf<Long, Long>() }
 
     // Interactive Pinch-to-Zoom & Pan state (100% .. 400%)
     var videoZoom by remember { mutableFloatStateOf(1.0f) }
@@ -231,16 +242,6 @@ fun VideoPlayerScreen(
     var centerDoubleTapTick by remember { mutableIntStateOf(0) }
     var playerError by remember { mutableStateOf<String?>(null) }
 
-    // Back closes "More videos" overlay first before exiting VideoPlayerScreen
-    BackHandler {
-        if (showMoreVideosSheet) {
-            showMoreVideosSheet = false
-            registerInteraction()
-        } else {
-            onBack()
-        }
-    }
-
     val overlayTextShadow = remember {
         Shadow(
             color = Color.Black.copy(alpha = 0.85f),
@@ -253,6 +254,16 @@ fun VideoPlayerScreen(
         hudIcon = icon
         hudText = text
         hudTick++
+    }
+
+    // FIX 5: Synchronize "More videos" horizontal LazyRow to currently playing video index when opened
+    LaunchedEffect(showMoreVideosSheet, activeVideoItem.id, playlistVideos) {
+        if (showMoreVideosSheet) {
+            val currentIdx = playlistVideos.indexOfFirst { it.id == activeVideoItem.id }
+            if (currentIdx >= 0) {
+                moreVideosListState.scrollToItem(currentIdx)
+            }
+        }
     }
 
     val zoomSteps = remember { listOf(1.0f, 1.25f, 1.5f, 2.0f, 3.0f) }
@@ -351,17 +362,55 @@ fun VideoPlayerScreen(
                     if (state == Player.STATE_ENDED && repeatMode == Player.REPEAT_MODE_OFF) {
                         isPlaying = false
                         areControlsVisible = true
+                        sessionPositions[activeVideoItem.id] = 0L
+                        onSavePlaybackPosition(activeVideoItem, 0L)
                     }
                 }
             })
         }
     }
 
-    // Load or switch encrypted video stream safely
+    // FIX 6: Helper to snapshot and persist current playback position for activeVideoItem
+    val saveCurrentPosition: () -> Unit = {
+        try {
+            val itemSnapshot = activeVideoItem
+            val dur = exoPlayer.duration.takeIf { it > 0L } ?: duration
+            val rawPos = exoPlayer.currentPosition.coerceAtLeast(0L)
+            val normalizedPos = if (
+                exoPlayer.playbackState == Player.STATE_ENDED ||
+                (dur > 0L && rawPos >= dur - 1500L)
+            ) {
+                0L
+            } else {
+                rawPos
+            }
+            sessionPositions[itemSnapshot.id] = normalizedPos
+            onSavePlaybackPosition(itemSnapshot, normalizedPos)
+        } catch (_: Throwable) {
+        }
+    }
+
+    // Back closes "More videos" overlay first before saving position and exiting VideoPlayerScreen
+    BackHandler {
+        if (showMoreVideosSheet) {
+            showMoreVideosSheet = false
+            registerInteraction()
+        } else {
+            saveCurrentPosition()
+            onBack()
+        }
+    }
+
+    // Load or switch encrypted video stream safely and resume from last saved playback position (FIX 6)
     LaunchedEffect(activeVideoItem.id, activeBlobFile, activeBaseIv) {
         playerError = null
-        currentPosition = 0L
-        duration = activeVideoItem.durationMs.coerceAtLeast(0L)
+        val latestItem = playlistVideos.firstOrNull { it.id == activeVideoItem.id } ?: activeVideoItem
+        val resumePosMs = (sessionPositions[activeVideoItem.id] ?: latestItem.lastPlaybackPositionMs).coerceAtLeast(0L)
+        val knownDur = latestItem.durationMs.coerceAtLeast(0L)
+        val shouldResume = resumePosMs > 0L && (knownDur <= 0L || resumePosMs < knownDur - 1500L)
+
+        currentPosition = if (shouldResume) resumePosMs else 0L
+        duration = knownDur
         videoZoom = 1.0f
         videoPanX = 0f
         videoPanY = 0f
@@ -384,13 +433,20 @@ fun VideoPlayerScreen(
             val mediaSource = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
                 .createMediaSource(mediaItem)
 
-            exoPlayer.setMediaSource(mediaSource)
-            exoPlayer.setPlaybackSpeed(playbackSpeed)
+            if (shouldResume) {
+                exoPlayer.setMediaSource(mediaSource, resumePosMs)
+            } else {
+                exoPlayer.setMediaSource(mediaSource)
+            }
+            exoPlayer.setPlaybackSpeed(if (isLongPress2xActive) 2.0f else playbackSpeed)
             exoPlayer.repeatMode = if (isRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
             exoPlayer.volume = if (isMuted) 0f else 1f
             exoPlayer.prepare()
             exoPlayer.playWhenReady = true
             isPlaying = true
+            if (shouldResume) {
+                showHud(Icons.Default.PlayArrow, "Resumed at ${formatTime(resumePosMs)}")
+            }
             if (!isScreenLocked) {
                 areControlsVisible = true
             }
@@ -416,6 +472,7 @@ fun VideoPlayerScreen(
                 return@LifecycleEventObserver
             }
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                saveCurrentPosition()
                 try {
                     exoPlayer.pause()
                 } catch (_: Throwable) {
@@ -426,6 +483,7 @@ fun VideoPlayerScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
 
         onDispose {
+            saveCurrentPosition()
             VaultRepository.unregisterActivePlayer(exoPlayer)
 
             currentView.keepScreenOn = false
@@ -570,9 +628,28 @@ fun VideoPlayerScreen(
                         } while (event.changes.any { it.pressed })
                     }
                 }
-                // Handler 2: Single-Tap controls toggle & Double-Tap (-10s / Play-Pause / +10s)
+                // Handler 2: Single-Tap controls toggle, Hold for 2x Speed (FIX 7), & Double-Tap (-10s / Play-Pause / +10s)
                 .pointerInput(isScreenLocked) {
                     detectTapGestures(
+                        onPress = {
+                            try {
+                                tryAwaitRelease()
+                            } finally {
+                                if (isLongPress2xActive) {
+                                    isLongPress2xActive = false
+                                    exoPlayer.setPlaybackSpeed(speedBeforeLongPress)
+                                }
+                            }
+                        },
+                        onLongPress = {
+                            if (isScreenLocked) {
+                                showUnlockHint = true
+                            } else if (!isLongPress2xActive) {
+                                speedBeforeLongPress = playbackSpeed
+                                isLongPress2xActive = true
+                                exoPlayer.setPlaybackSpeed(2.0f)
+                            }
+                        },
                         onTap = {
                             if (isScreenLocked) {
                                 showUnlockHint = !showUnlockHint
@@ -603,6 +680,7 @@ fun VideoPlayerScreen(
                                 }
                                 else -> {
                                     if (exoPlayer.isPlaying) {
+                                        saveCurrentPosition()
                                         exoPlayer.pause()
                                         isPlaying = false
                                         centerDoubleTapIcon = Icons.Default.Pause
@@ -775,9 +853,50 @@ fun VideoPlayerScreen(
                 }
             }
 
+            // FIX 7: Prominent Top-Center "2x Speed" Pill Indicator while Long-Pressing Screen
+            AnimatedVisibility(
+                visible = isLongPress2xActive,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 52.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = Color.Black.copy(alpha = 0.78f),
+                    modifier = Modifier
+                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), RoundedCornerShape(50))
+                        .testTag("player_2x_hold_indicator")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FastForward,
+                            contentDescription = "2x Speed",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "2x Speed",
+                            color = Color.White,
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                shadow = overlayTextShadow
+                            )
+                        )
+                    }
+                }
+            }
+
             // Crisp Translucent Pill HUD Overlay (top-center: Zoom %, Speed, Brightness, Volume, Seek, Loop)
             AnimatedVisibility(
-                visible = hudText != null,
+                visible = hudText != null && !isLongPress2xActive,
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier
@@ -922,7 +1041,10 @@ fun VideoPlayerScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
-                        onClick = onBack,
+                        onClick = {
+                            saveCurrentPosition()
+                            onBack()
+                        },
                         modifier = Modifier.testTag("player_back")
                     ) {
                         Icon(
@@ -1282,6 +1404,7 @@ fun VideoPlayerScreen(
                                 onClick = {
                                     registerInteraction()
                                     if (hasPrevVideo) {
+                                        saveCurrentPosition()
                                         activeVideoItem = playlistVideos[currentVideoIndex - 1]
                                     } else {
                                         exoPlayer.seekTo(0L)
@@ -1324,6 +1447,7 @@ fun VideoPlayerScreen(
                                 onClick = {
                                     registerInteraction()
                                     if (exoPlayer.isPlaying) {
+                                        saveCurrentPosition()
                                         exoPlayer.pause()
                                         isPlaying = false
                                     } else {
@@ -1370,6 +1494,7 @@ fun VideoPlayerScreen(
                                 onClick = {
                                     registerInteraction()
                                     if (hasNextVideo) {
+                                        saveCurrentPosition()
                                         activeVideoItem = playlistVideos[currentVideoIndex + 1]
                                     }
                                 },
@@ -1586,6 +1711,7 @@ fun VideoPlayerScreen(
 
                         // Large Horizontal 16:9 Video Cards (Title & Size Directly BELOW Thumbnail)
                         LazyRow(
+                            state = moreVideosListState,
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -1613,6 +1739,7 @@ fun VideoPlayerScreen(
                                             showMoreVideosSheet = false
                                             registerInteraction()
                                             if (videoItem.id != activeVideoItem.id) {
+                                                saveCurrentPosition()
                                                 activeVideoItem = videoItem
                                             }
                                         }

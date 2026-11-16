@@ -19,7 +19,7 @@ import java.io.File
  */
 @Database(
     entities = [VaultItem::class, FolderItem::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class VaultDatabase : RoomDatabase() {
@@ -47,6 +47,29 @@ abstract class VaultDatabase : RoomDatabase() {
                     """.trimIndent()
                 )
                 // Create the unique index on encryptedRelativePath
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_vault_items_encryptedRelativePath` ON `vault_items` (`encryptedRelativePath`)"
+                )
+            }
+        }
+
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Add lastPlaybackPositionMs column for resuming videos from last stopped position
+                db.execSQL(
+                    "ALTER TABLE `vault_items` ADD COLUMN `lastPlaybackPositionMs` INTEGER NOT NULL DEFAULT 0"
+                )
+                // Re-verify de-duplication and unique index on encryptedRelativePath
+                db.execSQL(
+                    """
+                    DELETE FROM vault_items
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM vault_items
+                        GROUP BY encryptedRelativePath
+                    )
+                    """.trimIndent()
+                )
                 db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS `index_vault_items_encryptedRelativePath` ON `vault_items` (`encryptedRelativePath`)"
                 )
@@ -102,7 +125,7 @@ abstract class VaultDatabase : RoomDatabase() {
                     VaultDatabase::class.java,
                     recheckTarget
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .setJournalMode(JournalMode.TRUNCATE)
                     .fallbackToDestructiveMigration(true)
                     .build()

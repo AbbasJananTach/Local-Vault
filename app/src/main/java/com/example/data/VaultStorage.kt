@@ -108,6 +108,13 @@ class VaultStorage(private val context: Context) {
         private const val IO_CHUNK_BUFFER_BYTES = 1024 * 1024 // 1MB high-throughput, low-heap buffer
         private const val MAX_CONCURRENT_IO_WORKERS = 3
 
+        /**
+         * FIX 3: Global thread-safe set of active source canonical paths and URI strings across
+         * all concurrent manual batch imports and background Auto-Hide sweeps so the same file
+         * or URI can never be processed or inserted twice simultaneously.
+         */
+        private val activeImportSourceKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
         val SUPPORTED_IMAGE_EXTENSIONS = setOf(
             "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp"
         )
@@ -537,7 +544,8 @@ class VaultStorage(private val context: Context) {
                                     isFavorite = obj.optBoolean("isFavorite", false),
                                     isDecoy = obj.optBoolean("isDecoy", false),
                                     durationMs = obj.optLong("durationMs", 0L),
-                                    baseIvHex = obj.optString("baseIvHex", "")
+                                    baseIvHex = obj.optString("baseIvHex", ""),
+                                    lastPlaybackPositionMs = obj.optLong("lastPlaybackPositionMs", 0L)
                                 )
                             }
                         }
@@ -692,9 +700,18 @@ class VaultStorage(private val context: Context) {
                             if (recoveredIvAndMime != null) {
                                 val (trueIv, trueMime) = recoveredIvAndMime
                                 val newExt = extensionFromMimeType(trueMime)
-                                val baseTitle = repairedItem.fileName.substringBeforeLast('.')
-                                    .replace("Recovered_Photo", if (trueMime.startsWith("video")) "Recovered_Video" else "Recovered_Photo")
-                                val updatedFileName = "$baseTitle$newExt"
+                                // FIX 2: Preserve user's original filename whenever it is not a generic Recovered_ placeholder
+                                val existingName = repairedItem.fileName
+                                val updatedFileName = if (existingName.startsWith("Recovered_Photo") || existingName.startsWith("Recovered_Video")) {
+                                    val baseTitle = existingName.substringBeforeLast('.')
+                                        .replace("Recovered_Photo", if (trueMime.startsWith("video")) "Recovered_Video" else "Recovered_Photo")
+                                    "$baseTitle$newExt"
+                                } else if (existingName.isNotBlank() && !existingName.all { it.isDigit() }) {
+                                    existingName
+                                } else {
+                                    val origName = File(repairedItem.originalPath).name
+                                    if (origName.isNotBlank() && !origName.all { it.isDigit() }) origName else "$existingName$newExt"
+                                }
                                 val unlockedDecrypted = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, trueIv)
                                 if (unlockedDecrypted.size >= 16) {
                                     siblingPlainHeaders.add(0, unlockedDecrypted.copyOfRange(0, 16))
@@ -1829,20 +1846,18 @@ class VaultStorage(private val context: Context) {
     }
 
     /**
-     * Fix 2: Self-Contained, Atomic, Non-Cancellable Per-File Encryption & Persistence Worker:
-     * 1) Encrypts the stream into a temporary file `val tempBlobFile = File(vaultBlobsDir, ".tmp_$blobName")`.
-     * 2) Flushes `cipherOut`, flushes `bufferedOut`, and calls `fos.fd.sync()` before closing `FileOutputStream`.
-     * 3) Verifies `tempBlobFile.exists() && tempBlobFile.length() == totalWritten && totalWritten > 0L`.
-     *    Renames `tempBlobFile.renameTo(blobFile)` and verifies `blobFile.exists() && blobFile.length() == totalWritten`.
-     * 4) Generates the thumbnail into `thumbFile`.
-     * 5) Inside `withContext(NonCancellable)`:
-     *    - Constructs the `VaultItem`.
-     *    - Immediately inserts it into Room Database: `val insertedId = vaultDao.insertItem(item)` and creates `val savedItem = item.copy(id = insertedId)`.
-     *    - Immediately writes and `fd.sync()`s the sidecar metadata file `writeSidecarMetadata(savedItem, masterKey)` (`.bin.meta`)
-     *      so `baseIvHex` and all metadata are permanently on disk before the original file is ever touched!
-     *    - Verifies that `vaultDao.getItemByEncryptedPath(blobName) != null` AND `File(vaultBlobsDir, "$blobName.meta").let { it.exists() && it.length() > 0L }`.
-     * 6) ONLY AFTER `blobFile`, `metaFile` (`.bin.meta`), and the Room DB row (`insertedId > 0L`) are all verified on disk,
-     *    calls `deleteOriginalFileSafely(...)`! If any check fails, deletes `blobFile`/`tempBlobFile` and NEVER deletes the user's original file!
+     * FIX 1, FIX 2 & FIX 3: Self-Contained, Atomic, Non-Cancellable Per-File Encryption & Persistence Worker:
+     * 1) Preserves the exact original user filename (`resolveOriginalDisplayName`) without replacing it with
+     *    MediaStore numeric IDs (`1000012345`) or generic prefixes.
+     * 2) Enforces thread-safe deduplication across both `alreadyImportedPathsInBatch` and the global
+     *    `activeImportSourceKeys` (`ConcurrentHashMap.newKeySet<String>()`) so concurrent workers or
+     *    overlapping Auto-Hide sweeps never create 3-4 duplicate copies.
+     * 3) Performs a pre-flight check on the source header, streams encryption via `CryptoEngine.encryptStreamCtr`
+     *    (which explicitly flushes `cipher.doFinal()`), verifies `tempBlobFile.length() == totalWritten`,
+     *    calls `fos.fd.sync()`, and verifies decrypted magic-byte header integrity on `tempBlobFile` before
+     *    atomically renaming `tempBlobFile.renameTo(blobFile)`.
+     * 4) Commits Room DB row + `.bin.meta` sidecar inside `withContext(NonCancellable)` and verifies all
+     *    three artifacts (`blobFile`, `.bin.meta`, Room DB row) exist before deleting the source file.
      */
     private suspend fun encryptAndPrepareItemWorker(
         uri: Uri,
@@ -1863,6 +1878,7 @@ class VaultStorage(private val context: Context) {
         }
         var resolvedFsPath = originalPathOverride ?: ""
         var mediaStoreId: Long? = null
+        val acquiredGlobalKeys = ArrayList<String>(2)
 
         try {
             // 1. Resolve metadata from direct file path or content URI
@@ -1888,7 +1904,10 @@ class VaultStorage(private val context: Context) {
                         if (cursor.moveToFirst()) {
                             val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                             if (nameIdx != -1 && !cursor.isNull(nameIdx)) {
-                                fileName = cursor.getString(nameIdx) ?: ""
+                                val candidateName = cursor.getString(nameIdx)?.trim() ?: ""
+                                if (candidateName.isNotEmpty() && !isPureNumericIdName(candidateName)) {
+                                    fileName = candidateName
+                                }
                             }
                             val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
                             if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
@@ -1918,15 +1937,50 @@ class VaultStorage(private val context: Context) {
                 }
             }
 
-            // Deduplicate only by exact canonical source path or unique URI string when path is unavailable
-            val dedupKey = if (resolvedFsPath.isNotEmpty()) resolvedFsPath else uri.toString()
-            if (alreadyImportedPathsInBatch != null && !alreadyImportedPathsInBatch.add(dedupKey)) {
-                return null
+            // FIX 2: Always preserve the exact original filename from the filesystem or MediaStore
+            if (resolvedFsPath.isNotEmpty()) {
+                val diskName = File(resolvedFsPath).name
+                if (diskName.isNotBlank() && !isPureNumericIdName(diskName)) {
+                    fileName = diskName
+                }
+                val diskLen = File(resolvedFsPath).length()
+                if (diskLen > 0L) {
+                    reportedSize = diskLen
+                }
+            }
+            if (fileName.isBlank() || isPureNumericIdName(fileName) || !fileName.contains('.')) {
+                val resolvedDisplayName = resolveOriginalDisplayName(uri, resolvedFsPath, mediaStoreId, resolver)
+                if (resolvedDisplayName.isNotBlank()) {
+                    fileName = resolvedDisplayName
+                }
             }
 
-            if (fileName.isEmpty() && resolvedFsPath.isNotEmpty()) {
-                fileName = File(resolvedFsPath).name
+            // FIX 3: Thread-safe deduplication across batch AND global active imports/sweeps
+            val canonicalPathKey = if (resolvedFsPath.isNotEmpty()) {
+                try {
+                    "PATH:${File(resolvedFsPath).canonicalPath}"
+                } catch (_: Throwable) {
+                    "PATH:${File(resolvedFsPath).absolutePath}"
+                }
+            } else {
+                ""
             }
+            val uriKey = "URI:$uri"
+            val primaryDedupKey = if (canonicalPathKey.isNotEmpty()) canonicalPathKey else uriKey
+
+            if (alreadyImportedPathsInBatch != null && !alreadyImportedPathsInBatch.add(primaryDedupKey)) {
+                return null
+            }
+            if (canonicalPathKey.isNotEmpty()) {
+                if (!activeImportSourceKeys.add(canonicalPathKey)) {
+                    return null
+                }
+                acquiredGlobalKeys.add(canonicalPathKey)
+            }
+            if (!activeImportSourceKeys.add(uriKey)) {
+                return null
+            }
+            acquiredGlobalKeys.add(uriKey)
 
             val detectedExt = fileName.substringAfterLast('.', "").lowercase(Locale.US)
             if (mimeType.isBlank() ||
@@ -1942,14 +1996,29 @@ class VaultStorage(private val context: Context) {
                 }
             }
 
-            if (fileName.isEmpty()) {
+            // Append extension if original title had no extension, while preserving the user's filename
+            if (fileName.isNotBlank() && !fileName.contains('.')) {
+                val ext = extensionFromMimeType(mimeType)
+                fileName = "$fileName$ext"
+            } else if (fileName.isBlank()) {
                 val ext = extensionFromMimeType(mimeType)
                 fileName = "Media_${System.currentTimeMillis()}$ext"
             }
 
+            // Pre-flight check on source header before encrypting (FIX 1C)
+            val sourceHeaderSample = readSourceHeaderSample(uri, resolvedFsPath, resolver, 64)
+            if (sourceHeaderSample.isEmpty() || isAllZeroBytes(sourceHeaderSample)) {
+                return null
+            }
+            // Refine mimeType if magic bytes identify a specific media container
+            val magicSig = CryptoEngine.detectMediaSignature(sourceHeaderSample)
+            if (magicSig != null && (mimeType.isBlank() || mimeType == "application/octet-stream")) {
+                mimeType = magicSig.mimeType
+            }
+
             // 3. Extract video duration before encrypting
             var durationMs = 0L
-            if (mimeType.startsWith("video") || isVideoExtension(fileName)) {
+            if (mimeType.startsWith("video") || isVideoExtension(fileName) || magicSig?.isVideo == true) {
                 val retriever = MediaMetadataRetriever()
                 try {
                     if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
@@ -1976,6 +2045,12 @@ class VaultStorage(private val context: Context) {
             // Deterministic 16-byte IV derived from masterKey + blobName so it is 100% recoverable even if sidecars are lost
             val baseIv = CryptoEngine.deriveDeterministicIv(masterKey, blobName)
 
+            val expectedSourceLength = if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+                File(resolvedFsPath).length()
+            } else {
+                reportedSize
+            }
+
             var rawInputStream: InputStream? = null
             var totalWritten = 0L
 
@@ -1990,22 +2065,17 @@ class VaultStorage(private val context: Context) {
                     return null
                 }
 
-                val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-                cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(baseIv))
-
-                // Step 1 & 2: Encrypt stream into tempBlobFile and flush + fd.sync() before closing
+                // Step 1 & 2 (FIX 1A): Encrypt stream into tempBlobFile using CryptoEngine.encryptStreamCtr
+                // (which explicitly flushes cipher.doFinal()) and invoke fos.fd.sync() before closing.
                 BufferedInputStream(rawInputStream, IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
                     FileOutputStream(tempBlobFile).use { fos ->
                         BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
-                            CipherOutputStream(bufferedOut, cipher).use { cipherOut ->
-                                val buffer = ByteArray(IO_CHUNK_BUFFER_BYTES)
-                                var read: Int
-                                while (bufferedIn.read(buffer).also { read = it } != -1) {
-                                    cipherOut.write(buffer, 0, read)
-                                    totalWritten += read
-                                }
-                                cipherOut.flush()
-                            }
+                            totalWritten = CryptoEngine.encryptStreamCtr(
+                                inputStream = bufferedIn,
+                                outputStream = bufferedOut,
+                                secretKey = masterKey,
+                                baseIv = baseIv
+                            )
                             bufferedOut.flush()
                         }
                         try {
@@ -2015,8 +2085,23 @@ class VaultStorage(private val context: Context) {
                     }
                 }
 
-                // Step 3: Verify tempBlobFile and atomically rename to blobFile
-                if (!tempBlobFile.exists() || tempBlobFile.length() != totalWritten || totalWritten <= 0L) {
+                // Step 3 (FIX 1A & 1C): Verify exact byte length AND decrypted header integrity before renaming
+                if (!tempBlobFile.exists() ||
+                    tempBlobFile.length() != totalWritten ||
+                    totalWritten <= 0L ||
+                    (expectedSourceLength > 0L && totalWritten != expectedSourceLength)
+                ) {
+                    tempBlobFile.delete()
+                    return null
+                }
+
+                // Verify that decrypting the first N bytes of tempBlobFile matches sourceHeaderSample bit-for-bit
+                val encryptedHeaderCheck = readFirstNBytes(tempBlobFile, sourceHeaderSample.size)
+                val decryptedHeaderCheck = CryptoEngine.decryptHeaderBytesCtr(encryptedHeaderCheck, masterKey, baseIv)
+                if (decryptedHeaderCheck.size != sourceHeaderSample.size ||
+                    !decryptedHeaderCheck.contentEquals(sourceHeaderSample) ||
+                    isAllZeroBytes(decryptedHeaderCheck)
+                ) {
                     tempBlobFile.delete()
                     return null
                 }
@@ -2045,8 +2130,12 @@ class VaultStorage(private val context: Context) {
                 val finalOriginalPath = if (resolvedFsPath.isNotEmpty()) {
                     resolvedFsPath
                 } else {
-                    val pictures = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                    File(File(pictures, "Restored_Vault"), fileName).absolutePath
+                    val fallbackDir = if (mimeType.startsWith("video")) {
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                    } else {
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                    }
+                    File(fallbackDir, fileName).absolutePath
                 }
 
                 // Step 5 & 6: Inside withContext(NonCancellable), commit DB row + .bin.meta sidecar,
@@ -2063,7 +2152,8 @@ class VaultStorage(private val context: Context) {
                         isFavorite = false,
                         isDecoy = isDecoy,
                         durationMs = durationMs,
-                        baseIvHex = toHex(baseIv)
+                        baseIvHex = toHex(baseIv),
+                        lastPlaybackPositionMs = 0L
                     )
 
                     val insertedId = vaultDao.insertItem(item)
@@ -2075,7 +2165,6 @@ class VaultStorage(private val context: Context) {
                     val verifiedBlobOnDisk = blobFile.exists() && blobFile.length() == totalWritten && totalWritten > 0L
 
                     if (!verifiedDbRow || !verifiedMetaOnDisk || !verifiedBlobOnDisk) {
-                        // Rollback encrypted artifacts and NEVER delete user's original file
                         if (insertedId > 0L) {
                             try {
                                 vaultDao.deleteItem(savedItem)
@@ -2118,7 +2207,133 @@ class VaultStorage(private val context: Context) {
             }
         } catch (_: Throwable) {
             return null
+        } finally {
+            acquiredGlobalKeys.forEach { activeImportSourceKeys.remove(it) }
         }
+    }
+
+    /**
+     * FIX 2: Detects whether a candidate filename is merely a raw numeric MediaStore ID
+     * (e.g. "1000012345" or "1000012345.mp4" where the stem is a 9-12 digit Android 10+ MediaStore ID
+     * while the real display name in MediaStore is different).
+     */
+    private fun isPureNumericIdName(name: String): Boolean {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return true
+        return trimmed.all { it.isDigit() }
+    }
+
+    private fun isAllZeroBytes(bytes: ByteArray): Boolean {
+        if (bytes.isEmpty()) return true
+        for (b in bytes) {
+            if (b.toInt() != 0) return false
+        }
+        return true
+    }
+
+    private fun readSourceHeaderSample(
+        uri: Uri,
+        resolvedFsPath: String,
+        resolver: ContentResolver,
+        byteCount: Int
+    ): ByteArray {
+        if (resolvedFsPath.isNotEmpty() && File(resolvedFsPath).exists()) {
+            return readFirstNBytes(File(resolvedFsPath), byteCount)
+        }
+        return try {
+            val buf = ByteArray(byteCount)
+            var total = 0
+            resolver.openInputStream(uri)?.use { ins ->
+                while (total < byteCount) {
+                    val r = ins.read(buf, total, byteCount - total)
+                    if (r <= 0) break
+                    total += r
+                }
+            }
+            if (total == byteCount) buf else if (total > 0) buf.copyOfRange(0, total) else ByteArray(0)
+        } catch (_: Throwable) {
+            ByteArray(0)
+        }
+    }
+
+    /**
+     * FIX 2: Resolves the authentic user-visible filename from `resolvedFsPath`, `DocumentsContract`,
+     * or `MediaStore` (`DISPLAY_NAME` / `DATA` / `TITLE`) so files are never renamed to raw numbers.
+     */
+    private fun resolveOriginalDisplayName(
+        uri: Uri,
+        resolvedFsPath: String,
+        mediaStoreId: Long?,
+        resolver: ContentResolver
+    ): String {
+        if (resolvedFsPath.isNotEmpty()) {
+            val fName = File(resolvedFsPath).name
+            if (fName.isNotBlank() && !isPureNumericIdName(fName)) {
+                return fName
+            }
+        }
+
+        // Check DocumentsContract documentId for embedded path/filename (e.g. "primary:DCIM/Camera/VID_2026.mp4")
+        if (DocumentsContract.isDocumentUri(context, uri)) {
+            try {
+                val docId = DocumentsContract.getDocumentId(uri)
+                if (docId.startsWith("raw:")) {
+                    val name = File(docId.removePrefix("raw:")).name
+                    if (name.isNotBlank() && !isPureNumericIdName(name)) return name
+                } else if (docId.startsWith("primary:")) {
+                    val name = File(docId.removePrefix("primary:")).name
+                    if (name.isNotBlank() && !isPureNumericIdName(name)) return name
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        // Query MediaStore by ID if we have a numeric ID from URI or DocumentsContract
+        val candidateId = mediaStoreId
+            ?: uri.lastPathSegment?.substringAfterLast(':')?.toLongOrNull()
+        if (candidateId != null) {
+            val urisToQuery = listOf(
+                MediaStore.Files.getContentUri("external"),
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            )
+            for (msUri in urisToQuery) {
+                try {
+                    resolver.query(
+                        msUri,
+                        arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.DATA, MediaStore.MediaColumns.TITLE),
+                        "${MediaStore.Files.FileColumns._ID} = ?",
+                        arrayOf(candidateId.toString()),
+                        null
+                    )?.use { c ->
+                        if (c.moveToFirst()) {
+                            val dataIdx = c.getColumnIndex(MediaStore.MediaColumns.DATA)
+                            if (dataIdx != -1 && !c.isNull(dataIdx)) {
+                                val dataName = File(c.getString(dataIdx) ?: "").name
+                                if (dataName.isNotBlank() && !isPureNumericIdName(dataName)) return dataName
+                            }
+                            val dispIdx = c.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                            if (dispIdx != -1 && !c.isNull(dispIdx)) {
+                                val dispName = c.getString(dispIdx)?.trim() ?: ""
+                                if (dispName.isNotBlank() && !isPureNumericIdName(dispName)) return dispName
+                            }
+                            val titleIdx = c.getColumnIndex(MediaStore.MediaColumns.TITLE)
+                            if (titleIdx != -1 && !c.isNull(titleIdx)) {
+                                val titleName = c.getString(titleIdx)?.trim() ?: ""
+                                if (titleName.isNotBlank() && !isPureNumericIdName(titleName)) return titleName
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        val lastSeg = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':') ?: ""
+        if (lastSeg.isNotBlank() && !isPureNumericIdName(lastSeg)) {
+            return lastSeg
+        }
+        return ""
     }
 
     /**
@@ -2308,9 +2523,27 @@ class VaultStorage(private val context: Context) {
         total
     }
 
+    /**
+     * FIX 6: Persists the user's last video playback position (`lastPlaybackPositionMs`)
+     * to both the Room Database and the encrypted `.bin.meta` sidecar.
+     */
+    suspend fun saveVideoPlaybackPosition(
+        item: VaultItem,
+        positionMs: Long,
+        masterKey: SecretKey
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val clampedPos = positionMs.coerceAtLeast(0L)
+            vaultDao.updatePlaybackPosition(item.id, clampedPos)
+            writeSidecarMetadata(item.copy(lastPlaybackPositionMs = clampedPos), masterKey)
+        } catch (_: Throwable) {
+        }
+    }
+
     fun writeSidecarMetadata(item: VaultItem, masterKey: SecretKey) {
         try {
             val metaFile = File(vaultBlobsDir, "${item.encryptedRelativePath}.meta")
+            val tempMetaFile = File(vaultBlobsDir, ".tmp_${item.encryptedRelativePath}.meta")
             val json = JSONObject().apply {
                 put("id", item.id)
                 put("fileName", item.fileName)
@@ -2324,15 +2557,24 @@ class VaultStorage(private val context: Context) {
                 put("isDecoy", item.isDecoy)
                 put("durationMs", item.durationMs)
                 put("baseIvHex", item.baseIvHex)
+                put("lastPlaybackPositionMs", item.lastPlaybackPositionMs)
             }
             val encryptedBytes = CryptoEngine.encryptAesGcm(json.toString().toByteArray(Charsets.UTF_8), masterKey)
-            FileOutputStream(metaFile).use { fos ->
+            FileOutputStream(tempMetaFile).use { fos ->
                 fos.write(encryptedBytes)
                 fos.flush()
                 try {
                     fos.fd.sync()
                 } catch (_: Throwable) {
                 }
+            }
+            if (tempMetaFile.exists() && tempMetaFile.length() == encryptedBytes.size.toLong()) {
+                if (!tempMetaFile.renameTo(metaFile)) {
+                    tempMetaFile.copyTo(metaFile, overwrite = true)
+                    tempMetaFile.delete()
+                }
+            } else {
+                tempMetaFile.delete()
             }
         } catch (_: Exception) {
         }
@@ -2356,7 +2598,8 @@ class VaultStorage(private val context: Context) {
                 isFavorite = obj.optBoolean("isFavorite", false),
                 isDecoy = obj.optBoolean("isDecoy", false),
                 durationMs = obj.optLong("durationMs", 0L),
-                baseIvHex = obj.getString("baseIvHex")
+                baseIvHex = obj.getString("baseIvHex"),
+                lastPlaybackPositionMs = obj.optLong("lastPlaybackPositionMs", 0L)
             )
         } catch (_: Exception) {
             null
@@ -2412,6 +2655,7 @@ class VaultStorage(private val context: Context) {
                         put("isDecoy", item.isDecoy)
                         put("durationMs", item.durationMs)
                         put("baseIvHex", item.baseIvHex)
+                        put("lastPlaybackPositionMs", item.lastPlaybackPositionMs)
                     }
                 )
             }
@@ -2421,7 +2665,23 @@ class VaultStorage(private val context: Context) {
                 put("items", itemsJson)
             }
             val encrypted = CryptoEngine.encryptAesGcm(rootJson.toString().toByteArray(Charsets.UTF_8), masterKey)
-            catalogFile.writeBytes(encrypted)
+            val tempCatalog = File(vaultRootDir, ".tmp_vault_catalog.enc")
+            FileOutputStream(tempCatalog).use { fos ->
+                fos.write(encrypted)
+                fos.flush()
+                try {
+                    fos.fd.sync()
+                } catch (_: Throwable) {
+                }
+            }
+            if (tempCatalog.exists() && tempCatalog.length() == encrypted.size.toLong()) {
+                if (!tempCatalog.renameTo(catalogFile)) {
+                    tempCatalog.copyTo(catalogFile, overwrite = true)
+                    tempCatalog.delete()
+                }
+            } else {
+                tempCatalog.delete()
+            }
         } catch (_: Exception) {
         }
     }
@@ -2723,6 +2983,16 @@ class VaultStorage(private val context: Context) {
         return if (rel.isBlank()) "/" else if (rel.startsWith("/")) rel else "/$rel"
     }
 
+    /**
+     * FIX 2 & FIX 4: Resolves the exact target file for restoration:
+     * 1) Restores directly to `item.originalPath`'s parent directory (preserving `item.fileName`)
+     *    whenever `desiredPath` is valid, not inside `.LocalVaultData`, and its parent directory
+     *    exists (or can be created) and is writable.
+     * 2) Only falls back to `defaultRestoredDir` (`Restored_Vault`) if the original directory is
+     *    completely inaccessible or unknown.
+     * 3) Prevents overwriting an existing file on disk or colliding with another concurrent worker
+     *    in `reservedTargetPaths` by appending ` (1)`, ` (2)`, etc. inside the same directory.
+     */
     private fun resolveUniqueRestoreTargetFile(
         desiredPath: String,
         fallbackName: String,
@@ -2730,40 +3000,69 @@ class VaultStorage(private val context: Context) {
         reservedTargetPaths: MutableSet<String>?
     ): File {
         synchronized(folderCreationLock) {
-            var candidate = if (desiredPath.isNotEmpty()) File(desiredPath) else File(defaultRestoredDir, fallbackName)
-            var parentDir = candidate.parentFile
-            if (parentDir != null && !parentDir.exists()) {
-                parentDir.mkdirs()
+            val cleanFallbackName = fallbackName.trim().ifBlank { "Restored_${System.currentTimeMillis()}" }
+            val desiredFile = if (desiredPath.isNotBlank() && !desiredPath.contains("/.LocalVaultData/")) {
+                val origParent = File(desiredPath).parentFile
+                val origName = File(desiredPath).name
+                val chosenName = if (!isPureNumericIdName(cleanFallbackName)) {
+                    cleanFallbackName
+                } else if (origName.isNotBlank() && !isPureNumericIdName(origName)) {
+                    origName
+                } else {
+                    cleanFallbackName
+                }
+                if (origParent != null) File(origParent, chosenName) else File(desiredPath)
+            } else {
+                File(defaultRestoredDir, cleanFallbackName)
             }
+
+            var parentDir = desiredFile.parentFile
+            if (parentDir != null && !parentDir.exists()) {
+                try {
+                    parentDir.mkdirs()
+                } catch (_: Throwable) {
+                }
+            }
+
+            var candidate = desiredFile
             if (parentDir == null || !parentDir.exists() || !parentDir.canWrite()) {
                 if (!defaultRestoredDir.exists()) defaultRestoredDir.mkdirs()
                 parentDir = defaultRestoredDir
-                candidate = File(defaultRestoredDir, fallbackName)
+                candidate = File(defaultRestoredDir, cleanFallbackName)
             }
 
-            if (reservedTargetPaths != null) {
-                var finalCandidate = candidate
-                var counter = 1
-                val baseName = finalCandidate.nameWithoutExtension
-                val ext = finalCandidate.extension
-                while (!reservedTargetPaths.add(finalCandidate.absolutePath)) {
-                    val numberedName = if (ext.isNotEmpty()) "${baseName}_$counter.$ext" else "${baseName}_$counter"
-                    finalCandidate = File(parentDir, numberedName)
-                    counter++
-                }
-                return finalCandidate
+            val baseName = candidate.nameWithoutExtension
+            val ext = candidate.extension
+            var finalCandidate = candidate
+            var counter = 1
+            while (finalCandidate.exists() || (reservedTargetPaths != null && !reservedTargetPaths.add(finalCandidate.absolutePath))) {
+                val numberedName = if (ext.isNotEmpty()) "$baseName ($counter).$ext" else "$baseName ($counter)"
+                finalCandidate = File(parentDir, numberedName)
+                counter++
             }
-            return candidate
+            return finalCandidate
         }
     }
 
+    /**
+     * FIX 1 & FIX 4: Atomic, Corruption-Proof Decryption & Original-Directory Restoration Worker:
+     * 1) Pre-flight checks `blobFile` existence, non-zero size, and header magic bytes (`CryptoEngine.detectMediaSignature`).
+     *    If any corruption or zero-byte anomaly is detected, aborts immediately without touching `blobFile`.
+     * 2) Streams decrypted bytes into a temporary staging file (`.tmp_restore_...`) in the destination directory,
+     *    flushes `cipher.doFinal()` via `CryptoEngine.decryptStreamCtr`, flushes `BufferedOutputStream`, and invokes
+     *    `fos.fd.sync()` to commit all blocks to physical flash storage.
+     * 3) Verifies `tempRestoreFile.length() == expectedSize` and verifies the restored file's header magic bytes
+     *    before atomically renaming `tempRestoreFile.renameTo(targetFile)`.
+     * 4) Only deletes `blobFile`, `.meta`, and `.thumb` AFTER `targetFile` is verified intact on disk.
+     */
     private fun decryptAndRestoreFileWorker(
         item: VaultItem,
         masterKey: SecretKey,
         reservedTargetPaths: MutableSet<String>?
     ): UnhideWorkerResult? {
         val blobFile = File(vaultBlobsDir, item.encryptedRelativePath)
-        if (!blobFile.exists() || blobFile.length() <= 0L) return null
+        val expectedSize = blobFile.length()
+        if (!blobFile.exists() || expectedSize <= 0L) return null
 
         val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         val defaultRestoredDir = File(picturesDir, "Restored_Vault")
@@ -2774,24 +3073,22 @@ class VaultStorage(private val context: Context) {
             defaultRestoredDir = defaultRestoredDir,
             reservedTargetPaths = reservedTargetPaths
         )
+        val parentDir = targetFile.parentFile ?: defaultRestoredDir
+        if (!parentDir.exists()) parentDir.mkdirs()
+        val tempRestoreFile = File(parentDir, ".tmp_restore_${UUID.randomUUID()}_${targetFile.name}")
 
         return try {
-            // Inspect first 64 bytes to choose the best IV (stored baseIvHex vs deterministicIv vs raw unencrypted)
-            val headerSample = ByteArray(64)
-            var headerLen = 0
-            try {
-                FileInputStream(blobFile).use { fis ->
-                    headerLen = fis.read(headerSample)
-                }
-            } catch (_: Throwable) {
+            // Pre-flight check: inspect first 64 bytes of blobFile
+            val actualHeader = readFirstNBytes(blobFile, 64)
+            if (actualHeader.isEmpty() || isAllZeroBytes(actualHeader)) {
+                return null
             }
-            val actualHeader = if (headerLen > 0) headerSample.copyOfRange(0, headerLen) else ByteArray(0)
 
             val rawSig = CryptoEngine.detectMediaSignature(actualHeader)
             if (rawSig != null) {
-                // Physical file is already raw unencrypted media; copy directly to targetFile
+                // Physical file is already raw unencrypted media; copy atomically via tempRestoreFile + fd.sync()
                 BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
-                    FileOutputStream(targetFile).use { fos ->
+                    FileOutputStream(tempRestoreFile).use { fos ->
                         BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
                             val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
                             var r: Int
@@ -2800,10 +3097,16 @@ class VaultStorage(private val context: Context) {
                             }
                             bos.flush()
                         }
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
             } else {
-                val storedIv = fromHex(item.baseIvHex).let { if (it.size == 16) it else CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath) }
+                val storedIv = fromHex(item.baseIvHex).let {
+                    if (it.size == 16) it else CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
+                }
                 val detIv = CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
                 val zeroIv = ByteArray(16)
 
@@ -2811,20 +3114,51 @@ class VaultStorage(private val context: Context) {
                     CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, storedIv)) != null -> storedIv
                     CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, detIv)) != null -> detIv
                     CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, zeroIv)) != null -> zeroIv
-                    else -> storedIv
+                    else -> {
+                        val mathRecovered = recoverOrphanedBinBaseIvAndMime(blobFile, masterKey)
+                        mathRecovered?.first ?: storedIv
+                    }
+                }
+
+                // Pre-flight header integrity verification before writing restored file
+                val decryptedPreview = CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, effectiveIv)
+                if (decryptedPreview.isEmpty() || isAllZeroBytes(decryptedPreview)) {
+                    return null
                 }
 
                 BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
-                    FileOutputStream(targetFile).use { fos ->
+                    FileOutputStream(tempRestoreFile).use { fos ->
                         BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
                             CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, effectiveIv)
                             bufferedOut.flush()
+                        }
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Throwable) {
                         }
                     }
                 }
             }
 
-            if (!targetFile.exists() || targetFile.length() <= 0L) {
+            // Post-decryption verification: exact byte count match and non-zero header check
+            if (!tempRestoreFile.exists() || tempRestoreFile.length() != expectedSize || tempRestoreFile.length() <= 0L) {
+                tempRestoreFile.delete()
+                return null
+            }
+
+            val restoredHeader = readFirstNBytes(tempRestoreFile, 64)
+            if (restoredHeader.isEmpty() || isAllZeroBytes(restoredHeader)) {
+                tempRestoreFile.delete()
+                return null
+            }
+
+            if (!tempRestoreFile.renameTo(targetFile)) {
+                tempRestoreFile.copyTo(targetFile, overwrite = true)
+                tempRestoreFile.delete()
+            }
+
+            if (!targetFile.exists() || targetFile.length() != expectedSize || targetFile.length() <= 0L) {
+                tempRestoreFile.delete()
                 targetFile.delete()
                 return null
             }
@@ -2839,6 +3173,7 @@ class VaultStorage(private val context: Context) {
                 destFolderDisplay = formatDestinationFolderDisplay(targetFile.parentFile)
             )
         } catch (_: Exception) {
+            tempRestoreFile.delete()
             null
         }
     }

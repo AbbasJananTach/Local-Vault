@@ -27,7 +27,8 @@ data class VaultItem(
     val isFavorite: Boolean = false,
     val isDecoy: Boolean = false,
     val durationMs: Long = 0L,
-    val baseIvHex: String
+    val baseIvHex: String,
+    val lastPlaybackPositionMs: Long = 0L
 ) {
     val vaultFilePath: String
         get() = encryptedRelativePath

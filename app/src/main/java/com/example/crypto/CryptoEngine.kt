@@ -512,6 +512,70 @@ object CryptoEngine {
         return resultIv
     }
 
+    /**
+     * FIX 1: Lossless AES-256-CTR Stream Encryption with Mandatory `cipher.doFinal()` Flush.
+     *
+     * Root Cause Fixed:
+     * Android's Conscrypt/OpenSSL JCE provider buffers partial 16-byte blocks inside `cipher.update(...)`
+     * and only emits the final 1..15 bytes when `cipher.doFinal()` is invoked. Furthermore,
+     * `javax.crypto.CipherOutputStream.close()` silently swallows `GeneralSecurityException`.
+     * By explicitly streaming `cipher.update(...)` and writing `cipher.doFinal()` directly to
+     * `outputStream`, we guarantee `totalCipherBytesWritten == totalPlainBytesRead` bit-for-bit.
+     */
+    fun encryptStreamCtr(
+        inputStream: InputStream,
+        outputStream: OutputStream,
+        secretKey: SecretKey,
+        baseIv: ByteArray
+    ): Long {
+        require(baseIv.size == 16) { "CTR IV must be 16 bytes" }
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, IvParameterSpec(baseIv))
+
+        val chunkBytes = 1024 * 1024 // 1MB buffer
+        val inBuffer = ByteArray(chunkBytes)
+        val outBuffer = ByteArray(chunkBytes + 32)
+        var totalPlainRead = 0L
+        var totalCipherWritten = 0L
+
+        while (true) {
+            val read = inputStream.read(inBuffer)
+            if (read == -1) break
+            if (read == 0) continue
+            totalPlainRead += read
+            val outLen = cipher.update(inBuffer, 0, read, outBuffer, 0)
+            if (outLen > 0) {
+                outputStream.write(outBuffer, 0, outLen)
+                totalCipherWritten += outLen
+            }
+        }
+
+        val finalBytes = cipher.doFinal()
+        if (finalBytes != null && finalBytes.isNotEmpty()) {
+            outputStream.write(finalBytes)
+            totalCipherWritten += finalBytes.size
+        }
+        outputStream.flush()
+
+        if (totalCipherWritten != totalPlainRead) {
+            throw IllegalStateException(
+                "AES-CTR encryption byte mismatch: read $totalPlainRead bytes but wrote $totalCipherWritten bytes"
+            )
+        }
+        return totalCipherWritten
+    }
+
+    /**
+     * FIX 1: Lossless AES-256-CTR Stream Decryption with Mandatory `cipher.doFinal()` Flush
+     * and 16-Byte Block Alignment.
+     *
+     * Root Cause Fixed:
+     * Previously, `decryptStreamCtr` looped `cipher.update(...)` and exited without calling
+     * `cipher.doFinal()`, truncating the final 1..15 bytes of any file whose byte length was
+     * not an exact multiple of 16 (corrupting MP4 `moov` tables or JPEG EOI markers at the end of files).
+     * Additionally, when `startOffset` is not a multiple of 16, the cipher is initialized at
+     * `blockAlignedStart = (startOffset / 16L) * 16L` so keystream alignment is 100% exact.
+     */
     fun decryptStreamCtr(
         inputStream: InputStream,
         outputStream: OutputStream,
@@ -519,26 +583,29 @@ object CryptoEngine {
         baseIv: ByteArray,
         startOffset: Long = 0L,
         lengthToRead: Long = -1L
-    ) {
-        val startBlockOffset = startOffset % 16
-        val adjustedIv = calculateCtrIvForOffset(baseIv, startOffset)
+    ): Long {
+        require(baseIv.size == 16) { "CTR IV must be 16 bytes" }
+        val startBlockOffset = (startOffset % 16L).toInt()
+        val blockAlignedStart = (startOffset / 16L) * 16L
+        val adjustedIv = calculateCtrIvForOffset(baseIv, blockAlignedStart)
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
         val ivSpec = IvParameterSpec(adjustedIv)
         cipher.init(Cipher.DECRYPT_MODE, secretKey, ivSpec)
 
         val chunkBytes = 1024 * 1024 // 1MB high-throughput, low-heap buffer for parallel workers
         val bufferSize = if (lengthToRead in 1L until chunkBytes.toLong()) {
-            maxOf(65_536, lengthToRead.toInt())
+            maxOf(65_536, (lengthToRead + startBlockOffset).toInt())
         } else {
             chunkBytes
         }
         val buffer = ByteArray(bufferSize)
         val outBuffer = ByteArray(bufferSize + 32)
-        var remainingBytesToRead = lengthToRead
-        var isFirstBlock = true
+        var remainingBytesToRead = if (lengthToRead > 0L) lengthToRead + startBlockOffset else -1L
+        var skipBytesRemaining = startBlockOffset
+        var totalPlainWritten = 0L
 
         while (remainingBytesToRead != 0L) {
-            val readSize = if (remainingBytesToRead > 0 && remainingBytesToRead < buffer.size) {
+            val readSize = if (remainingBytesToRead > 0L && remainingBytesToRead < buffer.size) {
                 remainingBytesToRead.toInt()
             } else {
                 buffer.size
@@ -546,23 +613,45 @@ object CryptoEngine {
 
             val read = inputStream.read(buffer, 0, readSize)
             if (read == -1) break
+            if (read == 0) continue
 
             val outLen = cipher.update(buffer, 0, read, outBuffer, 0)
             if (outLen > 0) {
-                if (isFirstBlock && startBlockOffset > 0) {
-                    val actualLength = outLen - startBlockOffset.toInt()
-                    if (actualLength > 0) {
-                        outputStream.write(outBuffer, startBlockOffset.toInt(), actualLength)
+                if (skipBytesRemaining > 0) {
+                    if (outLen <= skipBytesRemaining) {
+                        skipBytesRemaining -= outLen
+                    } else {
+                        val writeCount = outLen - skipBytesRemaining
+                        outputStream.write(outBuffer, skipBytesRemaining, writeCount)
+                        totalPlainWritten += writeCount
+                        skipBytesRemaining = 0
                     }
-                    isFirstBlock = false
                 } else {
                     outputStream.write(outBuffer, 0, outLen)
+                    totalPlainWritten += outLen
                 }
             }
 
-            if (remainingBytesToRead > 0) {
+            if (remainingBytesToRead > 0L) {
                 remainingBytesToRead -= read
             }
         }
+
+        // CRITICAL: Flush the final partial 16-byte CTR block held in the JCE cipher buffer!
+        val finalBytes = cipher.doFinal()
+        if (finalBytes != null && finalBytes.isNotEmpty()) {
+            if (skipBytesRemaining > 0) {
+                if (finalBytes.size > skipBytesRemaining) {
+                    val writeCount = finalBytes.size - skipBytesRemaining
+                    outputStream.write(finalBytes, skipBytesRemaining, writeCount)
+                    totalPlainWritten += writeCount
+                }
+            } else {
+                outputStream.write(finalBytes)
+                totalPlainWritten += finalBytes.size
+            }
+        }
+        outputStream.flush()
+        return totalPlainWritten
     }
 }

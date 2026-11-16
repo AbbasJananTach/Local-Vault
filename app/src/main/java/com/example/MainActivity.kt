@@ -730,13 +730,25 @@ class MainActivity : ComponentActivity() {
                                 scoped.ifEmpty { listOf(screen.item) }
                             }
                             masterKey?.let { key ->
+                                val currentVideoItem = remember(items, screen.item) {
+                                    items.firstOrNull { it.id == screen.item.id } ?: screen.item
+                                }
                                 VideoPlayerScreen(
-                                    vaultItem = screen.item,
+                                    vaultItem = currentVideoItem,
                                     blobFile = blobFile,
                                     baseIv = baseIv,
                                     masterKey = key,
                                     vaultBlobsDir = vaultStorage.vaultBlobsDir,
                                     playlistVideos = playlistVideos,
+                                    onSavePlaybackPosition = { videoItem, positionMs ->
+                                        scope.launch(Dispatchers.IO) {
+                                            vaultStorage.saveVideoPlaybackPosition(
+                                                item = videoItem,
+                                                positionMs = positionMs,
+                                                masterKey = key
+                                            )
+                                        }
+                                    },
                                     onBack = { currentScreen.value = Screen.Home }
                                 )
                             }

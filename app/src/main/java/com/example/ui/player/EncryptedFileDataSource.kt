@@ -14,14 +14,21 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.IvParameterSpec
 
 /**
- * Point 22 & Hotfix #1: Defensive Random-Access Streaming Decryption DataSource for Media3 / ExoPlayer.
- * - Supports arbitrary byte-range seeking (`open(DataSpec)` with exact `dataSpec.position` offset
- *   calculation and `read(buffer, offset, length)`).
- * - Performs deterministic, stateless AES-256-CTR 16-byte block alignment on every read:
- *   1. Computes `blockStart = (currentPosition / 16L) * 16L` and `intraBlockOffset = (currentPosition % 16L).toInt()`.
- *   2. Computes the exact 128-bit counter IV for `blockStart` via `CryptoEngine.calculateCtrIvForOffset`.
- *   3. Validates `baseIv` length and wraps JCE/I/O failures cleanly in `IOException` so ExoPlayer
- *      never throws an uncaught runtime crash during opening or scrubbing.
+ * FIX 1B: Stateless 16-Byte Block-Aligned AES-256-CTR Streaming DataSource for Media3 / ExoPlayer.
+ *
+ * Root Cause & Architectural Guarantee:
+ * - AES-CTR generates keystream in 16-byte (128-bit) blocks indexed by `blockIndex = byteOffset / 16`.
+ * - Whenever ExoPlayer seeks or reads from an arbitrary `currentPosition` (e.g., when reading the
+ *   `moov` atom at the end of a large MP4 or scrubbing the timeline), initializing AES-CTR with
+ *   `baseIv` directly or misaligning the file pointer corrupts the decrypted stream.
+ * - On EVERY `read(...)` call, this DataSource:
+ *   1. Computes the exact 16-byte block-aligned start offset: `blockStart = (currentPosition / 16L) * 16L`
+ *      and intra-block byte offset: `intraBlockOffset = (currentPosition % 16L).toInt()`.
+ *   2. Seeks the `RandomAccessFile` to `blockStart` and reads `intraBlockOffset + bytesToRead` bytes
+ *      (padded up to a full 16-byte block boundary when available on disk).
+ *   3. Computes the exact 128-bit counter IV for `blockStart` via `CryptoEngine.calculateCtrIvForOffset(baseIv, blockStart)`.
+ *   4. Decrypts the aligned chunk with `cipher.doFinal(...)` and copies `[intraBlockOffset .. intraBlockOffset + toCopy)`
+ *      into ExoPlayer's output buffer without ever modifying `blobFile` on disk.
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class EncryptedFileDataSource(
@@ -34,6 +41,7 @@ class EncryptedFileDataSource(
     private var uri: Uri? = null
     private var currentPosition: Long = 0L
     private var bytesRemaining: Long = 0L
+    private var fileLength: Long = 0L
     private var isOpen = false
     private val cipher: Cipher = Cipher.getInstance("AES/CTR/NoPadding")
 
@@ -44,20 +52,20 @@ class EncryptedFileDataSource(
         if (baseIv.size != 16) {
             throw IOException("Invalid video IV header size (${baseIv.size})")
         }
-        if (!blobFile.exists() || !blobFile.isFile) {
-            throw EOFException("Encrypted media blob not found: ${blobFile.name}")
+        if (!blobFile.exists() || !blobFile.isFile || blobFile.length() <= 0L) {
+            throw EOFException("Encrypted media blob not found or empty: ${blobFile.name}")
         }
 
         try {
             val raf = RandomAccessFile(blobFile, "r")
             randomAccessFile = raf
-            val fileLength = raf.length()
+            fileLength = raf.length()
 
             if (dataSpec.position < 0L) {
                 throw IOException("Invalid negative seek position: ${dataSpec.position}")
             }
 
-            if (dataSpec.position > fileLength) {
+            if (dataSpec.position >= fileLength) {
                 bytesRemaining = 0L
                 currentPosition = fileLength
                 isOpen = true
@@ -91,18 +99,30 @@ class EncryptedFileDataSource(
         val raf = randomAccessFile ?: return C.RESULT_END_OF_INPUT
         return try {
             val bytesToRead = minOf(length.toLong(), bytesRemaining).toInt()
+            if (bytesToRead <= 0) return C.RESULT_END_OF_INPUT
 
+            // Stateless 16-byte AES-CTR block alignment
             val blockStart = (currentPosition / 16L) * 16L
             val intraBlockOffset = (currentPosition % 16L).toInt()
-            val totalToRead = bytesToRead + intraBlockOffset
+            val rawNeeded = intraBlockOffset + bytesToRead
+            // Align read size to 16-byte multiple (clamped to remaining file length from blockStart)
+            val alignedNeeded = ((rawNeeded + 15) / 16) * 16
+            val maxAvailableFromBlockStart = (fileLength - blockStart).coerceAtLeast(0L).toInt()
+            val totalToRead = minOf(alignedNeeded, maxAvailableFromBlockStart)
 
-            raf.seek(blockStart)
+            if (totalToRead <= intraBlockOffset) {
+                return C.RESULT_END_OF_INPUT
+            }
+
             val encryptedBuffer = ByteArray(totalToRead)
             var totalReadFromDisk = 0
-            while (totalReadFromDisk < totalToRead) {
-                val r = raf.read(encryptedBuffer, totalReadFromDisk, totalToRead - totalReadFromDisk)
-                if (r == -1) break
-                totalReadFromDisk += r
+            synchronized(raf) {
+                raf.seek(blockStart)
+                while (totalReadFromDisk < totalToRead) {
+                    val r = raf.read(encryptedBuffer, totalReadFromDisk, totalToRead - totalReadFromDisk)
+                    if (r == -1) break
+                    totalReadFromDisk += r
+                }
             }
 
             if (totalReadFromDisk <= intraBlockOffset) {
